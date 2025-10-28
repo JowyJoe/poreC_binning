@@ -1,0 +1,20 @@
+inputs:
+  contigs_fasta: D:/path/to/contigs.fasta
+  porec_bam: D:/path/to/porec.bam
+outputs:
+  output_dir: D:/path/to/output
+filters:
+  mapq_min: 25
+  segment_min_bases: 800
+  min_segments_per_read: 3
+  read_coverage_min: 0.6
+  max_hyperedge_size: 20
+weights:
+  q_cap: 0.95
+spectral:
+  k: 0        # 0 表示自动选择k；若想固定k，填正整数
+  maxiter: 300
+  seed: 42
+streaming:
+  enabled: true
+  edges_per_chunk: 200000
