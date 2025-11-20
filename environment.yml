@@ -1,8 +1,7 @@
 name: hgbin
 channels:
-  - bioconda
   - conda-forge
-  - defaults
+  - bioconda
 dependencies:
   - python>=3.10
   - numpy>=1.24
