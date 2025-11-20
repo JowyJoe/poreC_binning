@@ -20,8 +20,9 @@ def build_from_porec(
     hyperedges: Iterable[Tuple[List[int], float]],
 ) -> Hypergraph:
     """
-    Build hypergraph from iterable of (member_indices, q_r) per read.
-    We set w_e = min(q_r, 0.95) / (|e|-1) with |e|>=2.
+    Build hypergraph from iterable of (member_indices, q_prime) per read.
+    We set w_e = q' * 2/(|e|-1) with |e|>=2, where q' is the per-read reliability
+    computed upstream from MAPQ (see io.bam.iterate_porec_hyperedges).
     """
     n = len(contig_names)
     data: List[int] = []
@@ -31,11 +32,12 @@ def build_from_porec(
     de_list: List[int] = []
 
     m = 0
-    for members, q_r in hyperedges:
+    for members, q_prime in hyperedges:
         k = len(members)
         if k < 2:
             continue
-        w_e = min(float(q_r), 0.95) / float(k - 1)
+        # per-edge weight with pairwise equal-share principle
+        w_e = float(q_prime) * (2.0 / float(k - 1))
         for v in members:
             rows.append(v)
             cols.append(m)

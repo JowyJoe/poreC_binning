@@ -25,10 +25,10 @@ class Config:
     porec_bam: str
     output_dir: str
     k: int
-    mapq_min: int = 20
-    segment_min_bases: int = 500
+    mapq_min: int = 30
+    segment_min_bases: int = 1000
     min_segments_per_read: int = 3
-    read_coverage_min: float = 0.6
+    read_coverage_min: float = 0.0
     max_hyperedge_size: int = 20
     q_cap: float = 0.95
     maxiter: int = 300
@@ -47,10 +47,10 @@ def load_config(config_path: Path, override_k: Optional[int] = None) -> Config:
         porec_bam=cfg["inputs"]["porec_bam"],
         output_dir=cfg["outputs"]["output_dir"],
         k=k,
-        mapq_min=int(cfg["filters"].get("mapq_min", 20)),
-        segment_min_bases=int(cfg["filters"].get("segment_min_bases", 500)),
+        mapq_min=int(cfg["filters"].get("mapq_min", 30)),
+        segment_min_bases=int(cfg["filters"].get("segment_min_bases", 1000)),
         min_segments_per_read=int(cfg["filters"].get("min_segments_per_read", 3)),
-        read_coverage_min=float(cfg["filters"].get("read_coverage_min", 0.6)),
+        read_coverage_min=float(cfg["filters"].get("read_coverage_min", 0.0)),
         max_hyperedge_size=int(cfg["filters"].get("max_hyperedge_size", 20)),
         q_cap=float(cfg.get("weights", {}).get("q_cap", 0.95)),
         maxiter=int(cfg["spectral"].get("maxiter", 300)),
@@ -83,7 +83,8 @@ def run_pipeline(config_path: Path, override_k: Optional[int] = None) -> None:
     def edge_iter() -> Iterable[Tuple[List[int], float]]:
         for members_names, q in iterate_porec_hyperedges(cfg.porec_bam, contig_set, flt):
             members_idx = [name_to_idx[n] for n in members_names]
-            yield members_idx, min(q, cfg.q_cap)
+            # q is q' (no capping); downstream converts to w_e = q' * 2/(k-1)
+            yield members_idx, float(q)
 
     if cfg.streaming:
         edges_dir = out_dir / "edges_chunks"
@@ -91,7 +92,7 @@ def run_pipeline(config_path: Path, override_k: Optional[int] = None) -> None:
             n_vertices=len(names),
             edge_iter=tqdm(edge_iter(), desc="Pore-C reads -> chunks"),
             out_dir=edges_dir,
-            q_cap=cfg.q_cap,
+            q_cap=cfg.q_cap,  # kept for compatibility; not used in weighting
             chunk_size=cfg.edges_per_chunk,
         )
         if len(edges.chunk_paths) == 0:

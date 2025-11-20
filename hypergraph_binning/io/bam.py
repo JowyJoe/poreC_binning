@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import pysam
+import numpy as np
 
 
 @dataclass
@@ -47,10 +48,10 @@ class ReadBundle:
 
 @dataclass
 class PoreCFilter:
-    mapq_min: int = 20
-    segment_min_bases: int = 500
+    mapq_min: int = 30
+    segment_min_bases: int = 1000
     min_segments_per_read: int = 3
-    read_coverage_min: float = 0.6
+    read_coverage_min: float = 0.0  # kept for compatibility; not used in weighting
     max_hyperedge_size: int = 20
 
 
@@ -124,34 +125,70 @@ def iterate_porec_hyperedges(
     flt: PoreCFilter,
 ) -> Iterator[Tuple[List[str], float]]:
     """
-    Yield (members, quality_weight) for each qualified Pore-C read as a hyperedge.
-    members: ordered unique contig names within the read
-    quality_weight: q_r in (0,1]
+    Yield (members, q_prime) for each qualified Pore-C read as a hyperedge.
+    members: ordered unique contig names within the read (after per-read dedup/merge)
+    q_prime (q'): r * (prod_i p_i)^(1/k), where p_i = 1 - 10^(-MAPQ_i/10),
+      r = explained fraction using per-contig merged aligned length / read length.
     """
     bam = pysam.AlignmentFile(bam_path, "rb" if bam_path.endswith(".bam") else "r")
     try:
         for bundle in _bundle_alignments_by_read(bam):
-            # filter segments by MAPQ and min length
+            # 1) per-segment filtering by MAPQ and min aligned length
             segs = [s for s in bundle.segments if s.mapq >= flt.mapq_min and s.qaln >= flt.segment_min_bases]
-            if len(segs) < flt.min_segments_per_read:
+            if not segs:
                 continue
-            # coverage fraction on read
-            if bundle.explained_frac < flt.read_coverage_min:
+
+            # 2) merge same-read hits on the same contig: keep max MAPQ and max aligned length
+            per_contig_mapq: Dict[str, int] = {}
+            per_contig_qaln: Dict[str, int] = {}
+            contigs_ordered: List[str] = []
+            seen: Set[str] = set()
+            for s in segs:
+                c = s.contig
+                if c not in contig_name_set:
+                    continue
+                if c not in seen:
+                    seen.add(c)
+                    contigs_ordered.append(c)
+                    per_contig_mapq[c] = int(s.mapq)
+                    per_contig_qaln[c] = int(s.qaln)
+                else:
+                    if s.mapq > per_contig_mapq[c]:
+                        per_contig_mapq[c] = int(s.mapq)
+                    if s.qaln > per_contig_qaln[c]:
+                        per_contig_qaln[c] = int(s.qaln)
+
+            # 3) k based on unique contigs after merge
+            k = len(contigs_ordered)
+            if k < flt.min_segments_per_read:
                 continue
-            # dedup contig IDs, and ensure they exist in contig set
-            contigs = [c for c in bundle.contig_set() if c in contig_name_set]
-            k = len(contigs)
-            if k < 2:
-                continue
+
+            # optionally truncate very large hyperedges deterministically
             if k > flt.max_hyperedge_size:
-                # truncate by keeping the first max_hyperedge_size members (deterministic)
-                contigs = contigs[:flt.max_hyperedge_size]
-                k = len(contigs)
-            # quality weight q_r
-            q_mapq = max(0.0, min(1.0, (bundle.mean_mapq() - flt.mapq_min) / max(1.0, 60 - flt.mapq_min)))
-            q_seg = max(0.0, min(1.0, (bundle.min_segment_qaln() - flt.segment_min_bases) / max(1.0, 2000 - flt.segment_min_bases)))
-            q_cov = bundle.explained_frac  # already 0..1
-            q_r = 0.2 + 0.8 * (0.5 * q_mapq + 0.25 * q_seg + 0.25 * q_cov)  # keep >0.2 baseline
-            yield contigs, float(q_r)
+                keep = contigs_ordered[:flt.max_hyperedge_size]
+                per_contig_mapq = {c: per_contig_mapq[c] for c in keep}
+                per_contig_qaln = {c: per_contig_qaln[c] for c in keep}
+                contigs_ordered = keep
+                k = len(contigs_ordered)
+
+            # 4) compute r using per-contig merged aligned length (avoid double counting)
+            qlen = max((s.qlen for s in segs), default=0)
+            merged_aln = sum(per_contig_qaln.values())
+            r = float(min(1.0, merged_aln / max(1, qlen))) if qlen > 0 else 0.0
+
+            # 5) compute q_read via geometric mean over p_i = 1 - 10^(-MAPQ/10)
+            p_vals = []
+            for c in contigs_ordered:
+                m = per_contig_mapq[c]
+                p = 1.0 - pow(10.0, -float(m) / 10.0)
+                # safety clamp
+                p_vals.append(float(np.clip(p, 1e-12, 1.0)))
+            if not p_vals:
+                continue
+            log_p = np.log(p_vals)
+            q_read = float(np.exp(log_p.mean()))
+            q_prime = float(np.clip(r * q_read, 0.0, 1.0))
+
+            yield contigs_ordered, q_prime
     finally:
         bam.close()

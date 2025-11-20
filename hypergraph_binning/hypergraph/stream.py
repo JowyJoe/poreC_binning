@@ -62,11 +62,12 @@ def write_edge_chunks(
         m_in_chunk = 0
         chunk_id += 1
 
-    for members, q in edge_iter:
+    for members, q_prime in edge_iter:
         k = len(members)
         if k < 2:
             continue
-        w_e = min(float(q), q_cap) / float(k - 1)
+        # per-edge weight with pairwise equal-share principle
+        w_e = float(q_prime) * (2.0 / float(k - 1))
         # update dv
         for v in members:
             dv[v] += w_e
