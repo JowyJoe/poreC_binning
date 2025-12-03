@@ -16,5 +16,3 @@ dependencies:
   - setuptools>=61.0
   - wheel
   - pip
-  - pip:
-    - .

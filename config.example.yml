@@ -1,6 +1,6 @@
 inputs:
-  contigs_fasta: D:/path/to/contigs.fasta
-  porec_bam: D:/path/to/porec.bam
+  contigs_fasta: /data/caojiawei/fastFile/poreAll.fasta
+  porec_bam: ...bam
 outputs:
   output_dir: D:/path/to/output
 filters:
@@ -18,3 +18,8 @@ spectral:
 streaming:
   enabled: true
   edges_per_chunk: 200000
+
+# Multiplex options (HyperBin-X)
+multiplex:
+  beta: 0.5       # Coupling strength between physical and chemical layers
+  knn_k: 5        # Number of neighbors for chemical graph

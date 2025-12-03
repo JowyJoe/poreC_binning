@@ -6,6 +6,7 @@ from typing import Optional
 
 from .pipeline.pipeline import run_pipeline, self_test_pipeline
 from .pipeline.export_bins import export_bins_fasta
+from .multiplex.pipeline import run_multiplex_pipeline
 
 app = typer.Typer(add_completion=False, help="Hypergraph spectral binning (single-source Pore-C)")
 
@@ -17,6 +18,16 @@ def pipeline(
 ):
     """Run end-to-end pipeline: BAM/SAM -> hypergraph -> spectral -> bins.tsv"""
     run_pipeline(config_path=config, override_k=k)
+
+
+@app.command("multiplex")
+def multiplex(
+    config: Path = typer.Argument(..., exists=True, help="Path to YAML config"),
+    k: Optional[int] = typer.Option(None, help="Override spectral k"),
+    beta: Optional[float] = typer.Option(None, help="Override coupling beta"),
+):
+    """Run HyperBin-X (Multiplex) pipeline: Pore-C + TNF."""
+    run_multiplex_pipeline(config_path=config, override_k=k, override_beta=beta)
 
 
 @app.command("self-test")
