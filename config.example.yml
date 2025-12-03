@@ -1,8 +1,8 @@
 inputs:
   contigs_fasta: /data/caojiawei/fastFile/poreAll.fasta
-  porec_bam: ...bam
+  porec_bam: /data/caojiawei/fastFile/poreAll.bam
 outputs:
-  output_dir: D:/path/to/output
+  output_dir: /data/caojiawei/fastFile/HyBins
 filters:
   mapq_min: 25
   segment_min_bases: 800
