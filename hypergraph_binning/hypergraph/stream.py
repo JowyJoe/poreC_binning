@@ -67,6 +67,7 @@ def write_edge_chunks(
         if k < 2:
             continue
         # per-edge weight with pairwise equal-share principle
+        # TODO: Review normalization factor. Future work may require adjusting this formula.
         w_e = float(q_prime) * (2.0 / float(k - 1))
         # update dv
         for v in members:

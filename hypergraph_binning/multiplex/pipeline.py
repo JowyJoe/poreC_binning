@@ -118,9 +118,13 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
     print(f"Running Spectral Embedding (k={cfg.k})...")
     U_norm = run_multiplex_embedding(L_supra, k=cfg.k, maxiter=cfg.maxiter, seed=cfg.seed)
     
+    # Determine actual k used (in case of auto-selection)
+    actual_k = U_norm.shape[1]
+    print(f"Using k={actual_k} for clustering.")
+
     # 6. Clustering
     print("Clustering...")
-    labels = kmeans_labels(U_norm, k=cfg.k, seed=cfg.seed)
+    labels = kmeans_labels(U_norm, k=actual_k, seed=cfg.seed)
     
     # 7. Output
     bins_path = out_dir / "bins.tsv"

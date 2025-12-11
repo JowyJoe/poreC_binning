@@ -5,32 +5,44 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import eigsh
 
+from ..spectral.kselect import largest_eigengap
+
+
 def run_multiplex_embedding(L_supra: csr_matrix, k: int, maxiter: int = 300, seed: int = 42) -> np.ndarray:
     """
     Compute k smallest eigenvectors of Supra-Laplacian.
     Returns U_final (N, k) after fusion and normalization.
+    If k <= 0, auto-select k using eigengap (searching up to k=60).
     """
     n2 = L_supra.shape[0]
     n = n2 // 2
     
+    # Determine how many eigenvectors to compute
+    if k <= 0:
+        k_search = 200  # Increased from 60 to 200 to cover more complex samples
+        print(f"Auto-selecting k (computing top {k_search} eigenvectors)...")
+    else:
+        k_search = k
+
     # Solve eigenproblem
     # We want smallest algebraic connectivity.
-    # Note: L_supra is symmetric.
-    # k+1 because the first one is usually 0 (connected component).
-    # But for clustering k classes, we usually need k eigenvectors.
-    # If the graph is connected, lambda_0 = 0, v_0 = const.
-    # We usually use v_1 ... v_k for clustering.
-    # Let's compute k eigenvectors.
-    # If k is small, we might get the null space.
-    # Standard spectral clustering uses bottom k eigenvectors.
-    
-    vals, vecs = eigsh(L_supra, k=k, which="SA", maxiter=maxiter, tol=1e-3, v0=None)
+    vals, vecs = eigsh(L_supra, k=k_search, which="SA", maxiter=maxiter, tol=1e-3, v0=None)
     
     # Sort by eigenvalues
     idx = np.argsort(vals)
     vals = vals[idx]
     vecs = vecs[:, idx]
     
+    # Auto-select k if needed
+    if k <= 0:
+        # Use heuristic: largest gap in [k_min, k_max]
+        # k_min=2 because k=1 is trivial (connected component)
+        best_k = largest_eigengap(vals, k_min=2, k_max=k_search-1)
+        print(f"Auto-selected k={best_k} based on eigengap.")
+        vecs = vecs[:, :best_k]
+        # Update k for subsequent logic if needed (though we just use vecs shape)
+        k = best_k
+
     # U is (2N, k)
     U = vecs
     

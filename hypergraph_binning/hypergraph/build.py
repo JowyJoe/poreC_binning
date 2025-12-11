@@ -37,6 +37,7 @@ def build_from_porec(
         if k < 2:
             continue
         # per-edge weight with pairwise equal-share principle
+        # TODO: Review normalization factor. Future work may require adjusting this formula.
         w_e = float(q_prime) * (2.0 / float(k - 1))
         for v in members:
             rows.append(v)
