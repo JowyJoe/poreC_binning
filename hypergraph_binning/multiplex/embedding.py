@@ -19,10 +19,15 @@ def run_multiplex_embedding(L_supra: csr_matrix, k: int, maxiter: int = 300, see
     
     # Determine how many eigenvectors to compute
     if k <= 0:
-        k_search = 200  # Increased from 60 to 200 to cover more complex samples
+        auto_cap = min(200, n - 1)
+        k_search = max(2, min(auto_cap, n2 - 2))
+        if k_search < 2:
+            raise ValueError("Cannot auto-select k with fewer than 2 contigs.")
         print(f"Auto-selecting k (computing top {k_search} eigenvectors)...")
     else:
-        k_search = k
+        k_search = min(k, n2 - 1)
+        if k_search <= 0:
+            raise ValueError("k must be greater than 0.")
 
     # Solve eigenproblem
     # We want smallest algebraic connectivity.
@@ -37,7 +42,8 @@ def run_multiplex_embedding(L_supra: csr_matrix, k: int, maxiter: int = 300, see
     if k <= 0:
         # Use heuristic: largest gap in [k_min, k_max]
         # k_min=2 because k=1 is trivial (connected component)
-        best_k = largest_eigengap(vals, k_min=2, k_max=k_search-1)
+        best_k = largest_eigengap(vals, k_min=2, k_max=k_search - 1)
+        best_k = max(2, min(best_k, k_search))
         print(f"Auto-selected k={best_k} based on eigengap.")
         vecs = vecs[:, :best_k]
         # Update k for subsequent logic if needed (though we just use vecs shape)
