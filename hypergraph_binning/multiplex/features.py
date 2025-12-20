@@ -84,78 +84,41 @@ def compute_tnf(fasta_path: str, min_length: int = 2000) -> Tuple[List[str], np.
 
 def build_knn_graph(features: np.ndarray, k: int = 5) -> Tuple[csr_matrix, np.ndarray]:
     """
-    Build KNN graph and return Incidence Matrix H_chem and Weights W_chem.
-    
+    Build a (mutual) KNN graph and return incidence matrix H_chem.
+
     H_chem: (N, N) sparse matrix. Column j represents the hyperedge centered at node j.
-            H[i, j] = 1 if node i is in the neighborhood of j (including j itself).
-    W_chem: (N,) weight vector for each hyperedge (column).
+            H[i, j] > 0 if node i is in the (mutual) KNN neighborhood of j (including j itself).
     """
     n_samples = features.shape[0]
-    
+
     # Fit KNN
-    nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto', metric='euclidean').fit(features)
+    nbrs = NearestNeighbors(n_neighbors=k, algorithm="auto", metric="euclidean").fit(features)
     distances, indices = nbrs.kneighbors(features)
-    
-    # Build H_chem (Incidence Matrix)
-    # Rows: Nodes (Contigs)
-    # Cols: Hyperedges (Centered at each Contig)
-    # If contig i is neighbor of j, then H[i, j] = 1
-    
-    # We use lil_matrix for construction
-    H = lil_matrix((n_samples, n_samples), dtype=np.float64)
-    
-    # Weights for each hyperedge (column j)
-    # We can define weight of hyperedge j based on the tightness of the neighborhood.
-    # Strategy: Average inverse distance of neighbors? Or sum?
-    # The plan suggested: w_ij = 1 / (1 + dist(i, j)) for each connection.
-    # But standard hypergraph spectral clustering usually assigns ONE weight to the whole hyperedge.
-    # However, Zhou et al. allows weighted H (H(v,e) can be weight).
-    # But our formula: Delta = I - Dv^-1/2 H W De^-1 H^T Dv^-1/2
-    # Usually H is binary (0/1). W is diagonal matrix of hyperedge weights.
-    
-    # Let's stick to the plan:
-    # "H_chem ... 第 j 列代表以 Contig j 为中心的超边"
-    # "填入化学权重 (反距离)" -> This implies H itself can be weighted?
-    # Or does it mean we calculate a weight for the hyperedge?
-    
-    # Re-reading plan: "填入化学权重 (反距离)" under "构建 H_chem".
-    # If H is weighted, then H[i, j] = weight between i and j.
-    # Then the formula uses H as is.
-    # Let's assume H contains the pairwise weights w_ij.
-    # And W (hyperedge weight) can be 1.0 (identity).
-    
-    # Wait, if H is weighted, then degree calculations need to account for it.
-    # d(v) = sum_e w(e) H(v,e)
-    # delta(e) = sum_v H(v,e)
-    # This works.
-    
-    # Let's implement H[i, j] = 1 / (1 + dist(i, j))
-    
-    # Vectorized construction of H
-    rows = []
-    cols = []
-    data = []
-    
+
+    # Pre-compute neighbor sets for mutual kNN filtering:
+    # j is considered a valid neighbor of i only if i is also in the KNN list of j.
+    neighbor_sets = [set(row) for row in indices]
+
+    # Vectorized construction of H (stored as weighted incidence matrix).
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
     for i in range(n_samples):
         # i is the center (column index of H)
-        # indices[i] are the neighbors (row indices of H)
-        # distances[i] are the distances
-        
         nbr_indices = indices[i]
         nbr_dists = distances[i]
-        
-        # Self loop is included in KNN (dist=0)
-        
+
         for idx, dist in zip(nbr_indices, nbr_dists):
+            # Keep only mutual nearest neighbours (mutual kNN)
+            if i not in neighbor_sets[idx]:
+                continue
             w = 1.0 / (1.0 + dist)
             rows.append(idx)
-            cols.append(i) # Column i is the hyperedge centered at i
+            cols.append(i)  # Column i is the hyperedge centered at i
             data.append(w)
-            
+
     H = csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
-    
-    # W_chem (hyperedge weights) - can be uniform 1.0 since we put weights in H
-    # Or we can use a global confidence for the hyperedge?
-    # For now, let's return H and let graph.py handle W.
-    
+
+    # W_chem (hyperedge weights) can be treated as identity since H already stores pairwise weights.
     return H

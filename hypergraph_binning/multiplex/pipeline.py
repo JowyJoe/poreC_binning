@@ -2,13 +2,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import json
 import yaml
-
 import pandas as pd
 from tqdm import tqdm
 
 from ..utils.contigs import read_contigs_fasta
-from ..io.bam import iterate_porec_hyperedges, PoreCFilter
+from ..io.bam import iterate_porec_hyperedges, PoreCFilter, PoreCStats
 from ..hypergraph.build import build_from_porec
 from ..clustering.kmeans_cluster import kmeans_labels
 
@@ -98,9 +98,16 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
     )
     
     contig_set = set(names)
+    porec_stats = PoreCStats()
     
     def edge_iter():
-        for members_names, q in iterate_porec_hyperedges(cfg.porec_bam, contig_set, flt):
+        for members_names, q in iterate_porec_hyperedges(
+            cfg.porec_bam,
+            contig_set,
+            flt,
+            stats=porec_stats,
+            log_every=100000,
+        ):
             members_idx = [name_to_idx[n] for n in members_names if n in name_to_idx]
             if len(members_idx) >= 2:
                 yield members_idx, float(q)
@@ -109,6 +116,17 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
     # If N is huge, 2N is huge. Streaming not fully supported for multiplex yet in this plan.
     hg = build_from_porec(names, tqdm(edge_iter(), desc="Pore-C reads"))
     L_phy = build_phy_laplacian(hg)
+
+    # Persist Pore-C stats for diagnostics
+    stats_path = out_dir / "porec_stats.json"
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(porec_stats.as_dict(), f, indent=2)
+    print(
+        "Pore-C summary: "
+        f"reads_total={porec_stats.reads_total:,}, "
+        f"read_pass_contigs={porec_stats.reads_pass_contigs:,}, "
+        f"edges_yielded={porec_stats.edges_yielded:,}"
+    )
     
     # 4. Supra-Laplacian
     print("Constructing Supra-Laplacian...")

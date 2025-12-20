@@ -210,3 +210,6 @@ __marimo__/
 /docs
 multiplex.md
 obstacles.md
+results/checkm2.tsv
+/scripts
+.serena/

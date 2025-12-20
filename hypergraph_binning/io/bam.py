@@ -55,6 +55,30 @@ class PoreCFilter:
     max_hyperedge_size: int = 20
 
 
+@dataclass
+class PoreCStats:
+    reads_total: int = 0
+    reads_pass_segments: int = 0
+    reads_pass_contigs: int = 0
+    reads_filtered_low_quality: int = 0
+    reads_filtered_small: int = 0
+    edges_truncated: int = 0
+    edges_yielded: int = 0
+    contig_hits_discarded: int = 0
+
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "reads_total": self.reads_total,
+            "reads_pass_segments": self.reads_pass_segments,
+            "reads_pass_contigs": self.reads_pass_contigs,
+            "reads_filtered_low_quality": self.reads_filtered_low_quality,
+            "reads_filtered_small": self.reads_filtered_small,
+            "edges_truncated": self.edges_truncated,
+            "edges_yielded": self.edges_yielded,
+            "contig_hits_discarded": self.contig_hits_discarded,
+        }
+
+
 def _bundle_alignments_by_read(bam: pysam.AlignmentFile) -> Iterator[ReadBundle]:
     """
     Group alignments by read_id. This requires BAM to be name-sorted for streaming efficiency.
@@ -123,6 +147,8 @@ def iterate_porec_hyperedges(
     bam_path: str,
     contig_name_set: Set[str],
     flt: PoreCFilter,
+    stats: Optional[PoreCStats] = None,
+    log_every: int = 0,
 ) -> Iterator[Tuple[List[str], float]]:
     """
     Yield (members, q_prime) for each qualified Pore-C read as a hyperedge.
@@ -131,12 +157,27 @@ def iterate_porec_hyperedges(
       r = explained fraction using per-contig merged aligned length / read length.
     """
     bam = pysam.AlignmentFile(bam_path, "rb" if bam_path.endswith(".bam") else "r")
+    log_every = int(log_every or 0)
     try:
         for bundle in _bundle_alignments_by_read(bam):
+            if stats is not None:
+                stats.reads_total += 1
+                if log_every and stats.reads_total % log_every == 0:
+                    print(
+                        f"[Pore-C] processed {stats.reads_total:,} reads "
+                        f"(yielded {stats.edges_yielded:,} edges, "
+                        f"pass_segments={stats.reads_pass_segments:,}, "
+                        f"pass_contigs={stats.reads_pass_contigs:,})"
+                    )
             # 1) per-segment filtering by MAPQ and min aligned length
             segs = [s for s in bundle.segments if s.mapq >= flt.mapq_min and s.qaln >= flt.segment_min_bases]
             if not segs:
+                if stats is not None:
+                    stats.reads_filtered_low_quality += 1
                 continue
+
+            if stats is not None:
+                stats.reads_pass_segments += 1
 
             # 2) merge same-read hits on the same contig: keep max MAPQ and max aligned length
             per_contig_mapq: Dict[str, int] = {}
@@ -146,6 +187,8 @@ def iterate_porec_hyperedges(
             for s in segs:
                 c = s.contig
                 if c not in contig_name_set:
+                    if stats is not None:
+                        stats.contig_hits_discarded += 1
                     continue
                 if c not in seen:
                     seen.add(c)
@@ -161,7 +204,11 @@ def iterate_porec_hyperedges(
             # 3) k based on unique contigs after merge
             k = len(contigs_ordered)
             if k < flt.min_segments_per_read:
+                if stats is not None:
+                    stats.reads_filtered_small += 1
                 continue
+            if stats is not None:
+                stats.reads_pass_contigs += 1
 
             # optionally truncate very large hyperedges deterministically
             if k > flt.max_hyperedge_size:
@@ -170,6 +217,8 @@ def iterate_porec_hyperedges(
                 per_contig_qaln = {c: per_contig_qaln[c] for c in keep}
                 contigs_ordered = keep
                 k = len(contigs_ordered)
+                if stats is not None:
+                    stats.edges_truncated += 1
 
             # 4) compute r using per-contig merged aligned length (avoid double counting)
             qlen = max((s.qlen for s in segs), default=0)
@@ -189,6 +238,8 @@ def iterate_porec_hyperedges(
             q_read = float(np.exp(log_p.mean()))
             q_prime = float(np.clip(r * q_read, 0.0, 1.0))
 
+            if stats is not None:
+                stats.edges_yielded += 1
             yield contigs_ordered, q_prime
     finally:
         bam.close()
