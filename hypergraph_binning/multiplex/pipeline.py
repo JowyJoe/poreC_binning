@@ -125,7 +125,10 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
         "Pore-C summary: "
         f"reads_total={porec_stats.reads_total:,}, "
         f"read_pass_contigs={porec_stats.reads_pass_contigs:,}, "
-        f"edges_yielded={porec_stats.edges_yielded:,}"
+        f"edges_yielded={porec_stats.edges_yielded:,}, "
+        f"contig_hits_discarded={porec_stats.contig_hits_discarded:,}, "
+        f"reads_filtered_low_quality={porec_stats.reads_filtered_low_quality:,}, "
+        f"reads_filtered_small={porec_stats.reads_filtered_small:,}"
     )
     
     # 4. Supra-Laplacian

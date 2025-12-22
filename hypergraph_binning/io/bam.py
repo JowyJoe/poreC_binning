@@ -96,25 +96,54 @@ def _bundle_alignments_by_read(bam: pysam.AlignmentFile) -> Iterator[ReadBundle]
 
     buffer: Dict[str, List[ReadSegment]] = {}
 
-    # Try to detect if name-sorted by checking first few records
-    prev_qname: Optional[str] = None
-    name_sorted = True
-    peeked: List[pysam.AlignedSegment] = []
-    for i, aln in enumerate(bam.fetch(until_eof=True)):
-        if i < 1000:
-            peeked.append(aln)
-            if prev_qname is not None and aln.query_name != prev_qname and any(a.query_name == prev_qname for a in peeked[-2:-1]):
-                # cannot reliably detect here; keep name_sorted True by default
-                pass
-        else:
-            break
-        prev_qname = aln.query_name
+    # Determine whether the BAM is name-sorted.
+    #
+    # This matters a lot for Pore-C/Hi-C style parsing where we need to group
+    # all (primary + supplementary) segments of the same read together.
+    header_dict = bam.header.to_dict() if hasattr(bam, "header") else {}
+    sort_order = (header_dict.get("HD") or {}).get("SO")
+
+    if sort_order == "queryname":
+        name_sorted = True
+    elif sort_order == "coordinate":
+        name_sorted = False
+    else:
+        # Heuristic: in a name-sorted BAM, once we move to a new query name,
+        # the previous query name should never re-appear.
+        name_sorted = True
+        closed: Set[str] = set()
+        prev_qname: Optional[str] = None
+        for i, aln in enumerate(bam.fetch(until_eof=True)):
+            if aln.is_unmapped or aln.is_secondary:
+                continue
+            qname = aln.query_name
+            if prev_qname is None:
+                prev_qname = qname
+                continue
+            if qname != prev_qname:
+                closed.add(prev_qname)
+                if qname in closed:
+                    name_sorted = False
+                    break
+                prev_qname = qname
+            if i >= 50_000:
+                break
+
     # Restart reading from beginning
     bam.reset()
 
+    if not name_sorted:
+        print(
+            "[Pore-C] BAM does not appear to be name-sorted; buffering alignments by read name. "
+            "For better performance, sort by read name (e.g., `samtools sort -n`)."
+        )
+
     if name_sorted:
         for aln in bam.fetch(until_eof=True):
-            if aln.is_unmapped or aln.is_secondary or aln.is_supplementary:
+            # Keep supplementary alignments: Pore-C/long reads often produce split/supplementary
+            # records that represent distinct segments of the same read and are needed to form
+            # multi-contig hyperedges. Still ignore secondary (alternative) alignments.
+            if aln.is_unmapped or aln.is_secondary:
                 continue
             qname = aln.query_name
             if current_id is None:
@@ -133,7 +162,8 @@ def _bundle_alignments_by_read(bam: pysam.AlignmentFile) -> Iterator[ReadBundle]
     else:
         # Fallback: coordinate-sorted; buffer by read name (memory heavy)
         for aln in bam.fetch(until_eof=True):
-            if aln.is_unmapped or aln.is_secondary or aln.is_supplementary:
+            # Same rationale as above: keep supplementary, ignore secondary/unmapped.
+            if aln.is_unmapped or aln.is_secondary:
                 continue
             qlen = aln.query_length or (aln.infer_query_length() or 0)
             qaln = aln.query_alignment_length or 0
