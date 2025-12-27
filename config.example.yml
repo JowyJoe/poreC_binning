@@ -1,6 +1,6 @@
 inputs:
   contigs_fasta: /data/caojiawei/fastFile/poreAll.fasta
-  porec_bam: /data/caojiawei/fastFile/poreAllout/bams/pass.ns.bam
+  porec_bam: /data/caojiawei/fastFile/poreAll.nsort.bam
 outputs:
   output_dir: /data/caojiawei/fastFile/HyBins
 filters:
