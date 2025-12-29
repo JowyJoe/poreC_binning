@@ -23,7 +23,7 @@ class MultiplexConfig:
     output_dir: str
     k: int
     beta: float = 0.5
-    knn_k: int = 5
+    knn_k: int = 10
     mapq_min: int = 30
     segment_min_bases: int = 1000
     min_segments_per_read: int = 3
@@ -45,7 +45,7 @@ def load_multiplex_config(config_path: Path, override_k: Optional[int] = None, o
         output_dir=cfg["outputs"]["output_dir"],
         k=k,
         beta=beta,
-        knn_k=int(cfg.get("multiplex", {}).get("knn_k", 5)),
+        knn_k=int(cfg.get("multiplex", {}).get("knn_k", 10)),
         mapq_min=int(cfg["filters"].get("mapq_min", 30)),
         segment_min_bases=int(cfg["filters"].get("segment_min_bases", 1000)),
         min_segments_per_read=int(cfg["filters"].get("min_segments_per_read", 3)),
