@@ -83,10 +83,14 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
     name_to_idx = {n: i for i, n in enumerate(names)}
     n_contigs = len(names)
 
-    # Build KNN
-    print("Building Chemical Graph...")
-    H_chem = build_knn_graph(tnf_features, k=cfg.knn_k)
-    L_chem = build_chem_laplacian(H_chem)
+    # Build KNN hypergraph (true hypergraph structure)
+    print("Building Chemical Layer (KNN hypergraph)...")
+    H_chem, w_chem, de_chem, dv_chem = build_knn_graph(
+        tnf_features,
+        k=cfg.knn_k,
+        weight_scheme="gaussian"
+    )
+    L_chem = build_chem_laplacian(H_chem, w_chem, de_chem, dv_chem)
     
     # 2. Physical Layer (Pore-C)
     print("Building Physical Layer (Pore-C)...")

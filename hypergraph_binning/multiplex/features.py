@@ -82,43 +82,81 @@ def compute_tnf(fasta_path: str, min_length: int = 2000) -> Tuple[List[str], np.
         
     return names, np.array(counts_list, dtype=np.float32)
 
-def build_knn_graph(features: np.ndarray, k: int = 5) -> Tuple[csr_matrix, np.ndarray]:
+def build_knn_graph(
+    features: np.ndarray,
+    k: int = 10,
+    weight_scheme: str = "gaussian",
+    sigma: float = None,
+) -> Tuple[csr_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Build a (mutual) KNN graph and return incidence matrix H_chem.
+    Build chemical layer as a true hypergraph (KNN neighborhoods as hyperedges).
 
-    H_chem: (N, N) sparse matrix. Column j represents the hyperedge centered at node j.
-            H[i, j] > 0 if node i is in the (mutual) KNN neighborhood of j (including j itself).
+    Each node i's k-nearest neighbors (including itself) form a hyperedge e_i.
+    Returns the same structure as physical layer: (H, w, de, dv)
+
+    Parameters
+    ----------
+    features : (N, D) TNF feature matrix
+    k : number of neighbors per hyperedge (including self)
+    weight_scheme :
+        - "gaussian": h(v,e) = exp(-d^2 / (2*sigma^2))
+        - "inverse": h(v,e) = 1 / (1 + d)
+        - "binary": h(v,e) = 1
+    sigma : Gaussian kernel bandwidth (auto-estimated if None)
+
+    Returns
+    -------
+    H : (N, N) hypergraph incidence matrix
+        H[i, j] = weight of node i in hyperedge j
+    w : (N,) hyperedge weights
+    de : (N,) hyperedge degrees (sum of node weights in each hyperedge)
+    dv : (N,) vertex degrees
     """
     n_samples = features.shape[0]
 
-    # Fit KNN
-    nbrs = NearestNeighbors(n_neighbors=k, algorithm="auto", metric="euclidean").fit(features)
+    # KNN query
+    nbrs = NearestNeighbors(n_neighbors=k, algorithm="auto", metric="euclidean")
+    nbrs.fit(features)
     distances, indices = nbrs.kneighbors(features)
 
-    # Pre-compute neighbor sets for mutual kNN filtering:
-    # j is considered a valid neighbor of i only if i is also in the KNN list of j.
-    neighbor_sets = [set(row) for row in indices]
+    # Auto-estimate sigma for Gaussian kernel
+    if weight_scheme == "gaussian" and sigma is None:
+        sigma = np.median(distances[:, 1:])  # exclude self-distance (0)
+        sigma = max(sigma, 1e-6)
+        print(f"[Chemical Layer] Auto-estimated sigma={sigma:.6f} for Gaussian kernel")
 
-    # Vectorized construction of H (stored as weighted incidence matrix).
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[float] = []
+    # Build incidence matrix H
+    # H[i, j] = weight of node i in hyperedge j (centered at node j)
+    rows = []
+    cols = []
+    data = []
 
-    for i in range(n_samples):
-        # i is the center (column index of H)
-        nbr_indices = indices[i]
-        nbr_dists = distances[i]
+    for j in range(n_samples):  # j = hyperedge index (also center node)
+        nbr_idx = indices[j]     # k neighbors of j (including j itself)
+        nbr_dist = distances[j]
 
-        for idx, dist in zip(nbr_indices, nbr_dists):
-            # Keep only mutual nearest neighbours (mutual kNN)
-            if i not in neighbor_sets[idx]:
-                continue
-            w = 1.0 / (1.0 + dist)
+        for idx, dist in zip(nbr_idx, nbr_dist):
+            # Compute node weight in this hyperedge
+            if weight_scheme == "gaussian":
+                h_val = np.exp(-dist**2 / (2 * sigma**2))
+            elif weight_scheme == "inverse":
+                h_val = 1.0 / (1.0 + dist)
+            else:  # binary
+                h_val = 1.0
+
             rows.append(idx)
-            cols.append(i)  # Column i is the hyperedge centered at i
-            data.append(w)
+            cols.append(j)
+            data.append(h_val)
 
     H = csr_matrix((data, (rows, cols)), shape=(n_samples, n_samples))
 
-    # W_chem (hyperedge weights) can be treated as identity since H already stores pairwise weights.
-    return H
+    # Compute hyperedge degree: de[j] = sum_i H[i, j]
+    de = np.array(H.sum(axis=0)).ravel()
+
+    # Hyperedge weights: average node weight as edge strength
+    w = de / k
+
+    # Vertex degree: dv[i] = sum_j w[j] * H[i, j]
+    dv = np.array((H @ w.reshape(-1, 1))).ravel()
+
+    return H, w, de, dv

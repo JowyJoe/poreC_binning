@@ -63,30 +63,23 @@ def build_phy_laplacian(hg: Hypergraph) -> csr_matrix:
     """Build physical layer Laplacian from Hypergraph object."""
     return _compute_laplacian_matrix(hg.H, hg.w, hg.de, hg.dv)
 
-def build_chem_laplacian(H_knn: csr_matrix) -> csr_matrix:
+def build_chem_laplacian(H: csr_matrix, w: np.ndarray, de: np.ndarray, dv: np.ndarray) -> csr_matrix:
     """
-    Build chemical layer Laplacian from KNN incidence matrix.
-    H_knn: (N, N) where col j is hyperedge centered at j.
-    Weights are already in H_knn values.
+    Build chemical layer Laplacian using the same formula as physical layer.
+    L = I - D_v^{-1/2} H W D_e^{-1} H^T D_v^{-1/2}
+
+    Parameters
+    ----------
+    H : (N, N) hypergraph incidence matrix
+    w : (N,) hyperedge weights
+    de : (N,) hyperedge degrees
+    dv : (N,) vertex degrees
+
+    Returns
+    -------
+    L_chem : (N, N) normalized Laplacian matrix
     """
-    n = H_knn.shape[0]
-    m = H_knn.shape[1] # should be n
-    
-    # Compute degrees
-    # Edge degree de[j] = sum_i H[i, j]
-    # Since H contains weights, this is weighted degree.
-    # Formula: delta(e) = sum_v h(v,e)
-    de = np.array(H_knn.sum(axis=0)).ravel()
-    
-    # Vertex degree dv[i] = sum_e w(e) h(v,e)
-    # Here w(e) is assumed 1.0 because weights are in h(v,e).
-    # So dv[i] = sum_j H[i, j]
-    dv = np.array(H_knn.sum(axis=1)).ravel()
-    
-    # Hyperedge weights w: all 1.0
-    w = np.ones(m, dtype=np.float64)
-    
-    return _compute_laplacian_matrix(H_knn, w, de, dv)
+    return _compute_laplacian_matrix(H, w, de, dv)
 
 def build_supra_laplacian(L_phy: csr_matrix, L_chem: csr_matrix, beta: float = 0.5) -> csr_matrix:
     """
