@@ -1,1 +1,23 @@
+# VS Code
 .vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Outputs
+out/
+outputs/
+results/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
