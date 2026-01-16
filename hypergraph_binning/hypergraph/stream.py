@@ -66,8 +66,8 @@ def write_edge_chunks(
         k = len(members)
         if k < 2:
             continue
-        # per-edge weight with pairwise equal-share principle
-        # TODO: Review normalization factor. Future work may require adjusting this formula.
+        # Hyperedge weight: w_e = q' * 2/(k-1)
+        # See build.py for detailed rationale on the normalization factor.
         w_e = float(q_prime) * (2.0 / float(k - 1))
         # update dv
         for v in members:

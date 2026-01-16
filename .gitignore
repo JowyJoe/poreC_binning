@@ -206,10 +206,13 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-#docs
-/docs
-multiplex.md
-obstacles.md
-results/checkm2.tsv
-/scripts
+# Project docs / notes / scripts
+# NOTE: keep these versioned to support reproducibility and paper review.
+# docs/
+# scripts/
+# multiplex.md
+# obstacles.md
+# results/checkm2.tsv
+
+# Serena (local cache / project metadata)
 .serena/

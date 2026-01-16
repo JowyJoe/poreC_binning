@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional
 import json
 import yaml
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -15,6 +16,8 @@ from ..clustering.kmeans_cluster import kmeans_labels
 from .features import compute_tnf, build_knn_graph
 from .graph import build_phy_laplacian, build_chem_laplacian, build_supra_laplacian
 from .embedding import run_multiplex_embedding
+from .auto_tune import auto_select_beta_k
+from .confidence import assess_and_filter
 
 @dataclass
 class MultiplexConfig:
@@ -31,14 +34,22 @@ class MultiplexConfig:
     min_contig_len: int = 2000
     maxiter: int = 300
     seed: int = 42
+    # Quality filtering options
+    enable_quality_filter: bool = True
+    confidence_threshold: float = 0.3
 
 def load_multiplex_config(config_path: Path, override_k: Optional[int] = None, override_beta: Optional[float] = None) -> MultiplexConfig:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    
+
     k = override_k if override_k is not None else int(cfg["spectral"].get("k", 50))
     beta = override_beta if override_beta is not None else float(cfg.get("multiplex", {}).get("beta", 0.5))
-    
+
+    # Quality filtering options
+    quality_cfg = cfg.get("quality", {})
+    enable_quality_filter = quality_cfg.get("enable_filter", True)  # Default on
+    confidence_threshold = float(quality_cfg.get("confidence_threshold", 0.3))
+
     return MultiplexConfig(
         contigs_fasta=cfg["inputs"]["contigs_fasta"],
         porec_bam=cfg["inputs"]["porec_bam"],
@@ -53,6 +64,8 @@ def load_multiplex_config(config_path: Path, override_k: Optional[int] = None, o
         min_contig_len=int(cfg["filters"].get("min_contig_len", 2000)),
         maxiter=int(cfg["spectral"].get("maxiter", 300)),
         seed=int(cfg["spectral"].get("seed", 42)),
+        enable_quality_filter=enable_quality_filter,
+        confidence_threshold=confidence_threshold,
     )
 
 def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, override_beta: Optional[float] = None) -> None:
@@ -134,39 +147,125 @@ def run_multiplex_pipeline(config_path: Path, override_k: Optional[int] = None, 
         f"reads_filtered_low_quality={porec_stats.reads_filtered_low_quality:,}, "
         f"reads_filtered_small={porec_stats.reads_filtered_small:,}"
     )
-    
-    # 4. Supra-Laplacian
-    print("Constructing Supra-Laplacian...")
-    L_supra = build_supra_laplacian(L_phy, L_chem, beta=cfg.beta)
-    
-    # 5. Embedding
-    print(f"Running Spectral Embedding (k={cfg.k})...")
-    U_norm = run_multiplex_embedding(L_supra, k=cfg.k, maxiter=cfg.maxiter, seed=cfg.seed)
-    
-    # Determine actual k used (in case of auto-selection)
-    actual_k = U_norm.shape[1]
-    print(f"Using k={actual_k} for clustering.")
 
-    # 6. Clustering
+    # 4. Auto-tuning or manual parameters
+    if cfg.k <= 0:
+        # Joint (β, k) auto-selection
+        print("Auto-tuning (β, k) using grid search...")
+        tune_result = auto_select_beta_k(
+            L_phy, L_chem,
+            maxiter=cfg.maxiter,
+            seed=cfg.seed,
+            verbose=True
+        )
+
+        best_beta = tune_result.best_beta
+        best_k = tune_result.best_k
+
+        # Save auto-tune results
+        tune_path = out_dir / "auto_tune_results.json"
+        with open(tune_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "best_beta": best_beta,
+                "best_k": best_k,
+                "best_score": tune_result.best_score,
+                "all_results": [(b, k, s) for b, k, s in tune_result.all_results]
+            }, f, indent=2)
+
+        # Use pre-computed eigenvectors from auto-tuning
+        U = tune_result.eigenvectors[:, :best_k]
+        U_phy = U[:n_contigs, :]
+        U_chem = U[n_contigs:, :]
+        U_fused = (U_phy + U_chem) / 2.0
+        norms = np.linalg.norm(U_fused, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        U_norm = U_fused / norms
+
+        actual_k = best_k
+        print(f"Auto-selected: β={best_beta}, k={best_k}")
+    else:
+        # Use specified β and k
+        print("Constructing Supra-Laplacian...")
+        L_supra = build_supra_laplacian(L_phy, L_chem, beta=cfg.beta)
+
+        print(f"Running Spectral Embedding (k={cfg.k})...")
+        U_norm = run_multiplex_embedding(L_supra, k=cfg.k, maxiter=cfg.maxiter, seed=cfg.seed)
+
+        actual_k = U_norm.shape[1]
+        print(f"Using k={actual_k} for clustering.")
+
+    # 5. Clustering
     print("Clustering...")
     labels = kmeans_labels(U_norm, k=actual_k, seed=cfg.seed)
-    
+
+    # 6. Quality Assessment and Filtering
+    if cfg.enable_quality_filter:
+        print("Running quality assessment...")
+        # Build contact matrix from hypergraph for quality assessment
+        contact_matrix = hg.to_adjacency()
+
+        quality_result = assess_and_filter(
+            X=U_norm,
+            labels=labels,
+            contact_matrix=contact_matrix,
+            tnf_matrix=tnf_features,
+            coverage=None,  # Coverage not available in current pipeline
+            confidence_threshold=cfg.confidence_threshold,
+            verbose=True
+        )
+
+        # Use filtered labels
+        final_labels = quality_result.filtered_labels
+
+        # Save quality metrics
+        quality_path = out_dir / "quality_metrics.json"
+        with open(quality_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "n_bins_original": quality_result.n_bins_original,
+                "n_bins_filtered": quality_result.n_bins_filtered,
+                "n_unassigned": quality_result.n_unassigned,
+                "confidence_threshold": cfg.confidence_threshold,
+                "bin_qualities": [
+                    {
+                        "bin_id": q.bin_id,
+                        "n_contigs": q.n_contigs,
+                        "mean_silhouette": q.mean_silhouette,
+                        "mean_contact_ratio": q.mean_contact_ratio,
+                        "tnf_consistency": q.tnf_consistency,
+                        "pore_c_connectivity": q.pore_c_connectivity,
+                        "overall_quality": q.overall_quality
+                    }
+                    for q in quality_result.bin_qualities
+                ]
+            }, f, indent=2)
+        print(f"Quality metrics saved to {quality_path}")
+    else:
+        final_labels = labels
+
     # 7. Output
     bins_path = out_dir / "bins.tsv"
     print(f"Writing results to {bins_path}")
     with open(bins_path, "w", encoding="utf-8") as f:
         f.write("contig\tbin\n")
-        for name, lab in zip(names, labels):
-            f.write(f"{name}\tbin_{int(lab)}\n")
-            
-    # Summary
+        for name, lab in zip(names, final_labels):
+            if lab < 0:
+                f.write(f"{name}\tunassigned\n")
+            else:
+                f.write(f"{name}\tbin_{int(lab)}\n")
+
+    # Summary (exclude unassigned)
+    assigned_mask = final_labels >= 0
+    assigned_labels = final_labels[assigned_mask]
     summary = (
-        pd.Series(labels)
+        pd.Series(assigned_labels)
         .value_counts()
         .rename_axis("bin")
         .reset_index(name="num_contigs")
         .sort_values("num_contigs", ascending=False)
     )
     summary.to_csv(out_dir / "bin_sizes.tsv", sep="\t", index=False)
-    
+
+    n_assigned = assigned_mask.sum()
+    n_unassigned = (~assigned_mask).sum()
+    print(f"Assigned: {n_assigned} contigs, Unassigned: {n_unassigned} contigs")
     print("Multiplex Pipeline Completed.")

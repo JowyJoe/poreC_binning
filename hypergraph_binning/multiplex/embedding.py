@@ -31,7 +31,10 @@ def run_multiplex_embedding(L_supra: csr_matrix, k: int, maxiter: int = 300, see
 
     # Solve eigenproblem
     # We want smallest algebraic connectivity.
-    vals, vecs = eigsh(L_supra, k=k_search, which="SA", maxiter=maxiter, tol=1e-3, v0=None)
+    # Use fixed v0 for reproducibility (eigsh uses random init if v0=None)
+    rng = np.random.RandomState(seed)
+    v0 = rng.randn(n2)
+    vals, vecs = eigsh(L_supra, k=k_search, which="SA", maxiter=maxiter, tol=1e-3, v0=v0)
     
     # Sort by eigenvalues
     idx = np.argsort(vals)

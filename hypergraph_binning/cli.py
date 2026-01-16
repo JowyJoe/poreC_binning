@@ -36,10 +36,6 @@ def self_test():
     self_test_pipeline()
 
 
-if __name__ == "__main__":
-    app()
-
-
 @app.command("export-bins")
 def export_bins(
     contigs: Path = typer.Argument(..., exists=True, help="Contigs FASTA path"),
@@ -50,3 +46,7 @@ def export_bins(
     out_dir.mkdir(parents=True, exist_ok=True)
     export_bins_fasta(contigs, bins, out_dir)
     typer.echo(f"Per-bin FASTA written to {out_dir}")
+
+
+if __name__ == "__main__":
+    app()
