@@ -12,6 +12,25 @@ pip install -e .
 
 Dependencies (key ones): `pyarrow`, `python-igraph`, `leidenalg`, `typer`, `rich`.
 
+### Install (conda, recommended on servers)
+
+Use the provided `environment.yml` to get a stable stack for `pyarrow/python-igraph/leidenalg`:
+
+```bash
+conda env create -f environment.yml
+conda activate porebin
+pip install -e . --no-deps
+```
+
+If you prefer not to use `environment.yml`:
+
+```bash
+conda create -n porebin python=3.10 -y
+conda activate porebin
+conda install -c conda-forge -y pyarrow python-igraph leidenalg typer rich
+pip install -e . --no-deps
+```
+
 ## Commands
 
 - `porebin normalize`: PPL `.contacts` (segment-level TSV) → internal `contacts.parquet`
