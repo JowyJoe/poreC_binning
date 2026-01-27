@@ -175,6 +175,8 @@ def build_graph(
         "input_contigs_fasta": str(contigs_fasta),
         "input_contacts_parquet": str(contacts_parquet),
         "order_norm_method": order_norm_method,
+        "order_norm_formula": _order_norm_formula(order_norm_method),
+        "edge_weight_formula": "edge_weight = OrderNorm(k) * contact_weight",
         "num_contigs": len(contig_names),
         "num_contacts": stats.contacts_kept,
         "num_edges": stats.edges_written,
@@ -211,8 +213,16 @@ def _dedupe(items: list[str]) -> list[str]:
 def _k_summary(k_counter: Counter[int]) -> dict[str, Any]:
     if not k_counter:
         return {"min": None, "max": None, "mean": None}
-    min_k = min(k_counter)
-    max_k = max(k_counter)
+    min_order = min(k_counter)
+    max_order = max(k_counter)
     total = sum(k_counter.values())
-    mean_k = sum(k * c for k, c in k_counter.items()) / total
-    return {"min": min_k, "max": max_k, "mean": mean_k}
+    mean_order = sum(k * c for k, c in k_counter.items()) / total
+    return {"min": min_order, "max": max_order, "mean": mean_order}
+
+
+def _order_norm_formula(method: str) -> str:
+    if method == "pair":
+        return "2/(k*(k-1))  # == 1/C(k,2)"
+    if method == "star":
+        return "1/(k-1)"
+    return "unknown"

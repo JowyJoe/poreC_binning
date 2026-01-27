@@ -38,6 +38,7 @@ pip install -e . --no-deps
 - `porebin cluster`: Leiden on bipartite graph → `bins.tsv`
 - `porebin export`: `bins.tsv` + FASTA → `bins_fasta/bin_<id>.fasta`
 - `porebin run`: normalize + build + cluster + export
+  - add `--pairwise-baseline` to run a clique-expansion contig-contig graph baseline instead of the bipartite hypergraph.
 
 All commands write `out_dir/run.json` (parameters, time, version, seed).
 
@@ -48,7 +49,7 @@ All commands write `out_dir/run.json` (parameters, time, version, seed).
 TSV with **11 or 12 columns**, with or without header. The normalizer needs these fields:
 - `readID`: read identifier (used to group segments into a contact)
 - `chr`: contig/reference name
-- `status`: default keeps only `passed`
+- `status`: default keeps only `passed` (override with `--keep-status <label>` or `--keep-status all`)
 - `score` (optional): tags like `mapq:60;AS:123` (parsed if present)
 
 Notes:
@@ -60,6 +61,29 @@ Notes:
 `contacts.parquet` contains one row per contact/hyperedge:
 - required: `contact_id`, `contigs` (list[str]), `k`, `weight`, `support_count`
 - optional evidence: `mapq_min`, `mapq_mean`, `as_sum`, `n_segments`
+
+## Pairwise baseline (for papers)
+
+This is a **pairwise normal graph** control built from the same Pore-C data via clique expansion, with fair per-read weights:
+- for each read with order `k`, each pair gets `w_pair = 2/(k*(k-1)) = 1/C(k,2)` so that all pairs from that read sum to 1.
+
+Prepare a passed-only contacts file (column 11 must be `passed`):
+
+```bash
+awk -F'\t' '$11=="passed"' hyper.merged.contacts > porec.passed.contacts
+```
+
+The pairwise baseline requires the input to be grouped by readID (column 4). If needed:
+
+```bash
+sort -k4,4 porec.passed.contacts > porec.passed.sorted.contacts
+```
+
+Run:
+
+```bash
+porebin run --pairwise-baseline --ppl-contacts porec.passed.sorted.contacts --contigs contigs.fasta --out out_pw --seed 0
+```
 
 ## Minimal example
 
