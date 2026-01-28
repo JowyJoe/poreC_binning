@@ -49,7 +49,7 @@ def record_run(
     command: str,
     params: dict[str, Any],
     seed: Optional[int] = None,
-) -> Iterator[None]:
+) -> Iterator[dict[str, Any]]:
     run_path = out_dir / "run.json"
     started_at = utc_now_iso()
     record: dict[str, Any] = {
@@ -71,7 +71,7 @@ def record_run(
     write_json(run_path, record)
 
     try:
-        yield
+        yield record
     except Exception as exc:
         record["status"] = "error"
         record["error"] = {"type": type(exc).__name__, "message": str(exc)}

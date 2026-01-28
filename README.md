@@ -2,7 +2,7 @@
 
 Hypergraph-preserving metagenome binning from Nanopore Pore-C multi-way contacts.
 
-Core idea: treat each multi-way contact as a **hyperedge**, keep it via a **contig–contact bipartite graph**, then run **Leiden** on that bipartite graph. No clique expansion.
+Core idea: treat each multi-way contact as a **hyperedge**, keep it via a **contig–contact bipartite graph**, then run **Leiden** on that bipartite graph (no clique expansion).
 
 ## Install
 
@@ -33,28 +33,37 @@ pip install -e . --no-deps
 
 ## Commands
 
-- `porebin normalize`: PPL `.contacts` (segment-level TSV) → internal `contacts.parquet`
-- `porebin build`: contigs FASTA + `contacts.parquet` → `graph/` (COO edges)
-- `porebin cluster`: Leiden on bipartite graph → `bins.tsv`
-- `porebin export`: `bins.tsv` + FASTA → `bins_fasta/bin_<id>.fasta`
-- `porebin run`: normalize + build + cluster + export
-  - add `--pairwise-baseline` to run a clique-expansion contig-contig graph baseline instead of the bipartite hypergraph.
+- `porebin run`: normalize + build + cluster (coarse `bins.tsv`)
+- `porebin refine`: automatic recruit/decontam/split → `bins.refined.tsv` (+ `run_refine.json`)
+- `porebin export`: export FASTA with built-in policy (keep bins ≥200kb; short contigs/tiny bins → `unbinned.fasta`)
+- Advanced: `porebin normalize`, `porebin build`, `porebin cluster`
 
-All commands write `out_dir/run.json` (parameters, time, version, seed).
+All commands write `out_dir/run.json` (parameters, time, version, seed). `porebin refine` additionally writes `out_dir/run_refine.json`.
+
+## Typical workflow (no threshold parameters)
+
+```bash
+# 1) coarse bins
+porebin run --ppl-contacts porec.contacts --contigs contigs.fasta --out coarse --seed 0
+
+# 2) refine (optional, no user thresholds)
+porebin refine --contigs contigs.fasta --ppl-contacts porec.contacts --bins-tsv coarse/bins.tsv --out refined --seed 0
+
+# 3) export (built-in min bin size = 200kb)
+porebin export --contigs contigs.fasta --bins-tsv refined/bins.refined.tsv --out final_bins
+```
 
 ## Input formats
 
-### PPL `.contacts` (for `porebin normalize`)
+### PPL `.contacts` (for `porebin run/normalize/refine`)
 
-TSV with **11 or 12 columns**, with or without header. The normalizer needs these fields:
+TSV with **11 or 12 columns**, with or without header. The normalizer expects these semantics:
 - `readID`: read identifier (used to group segments into a contact)
 - `chr`: contig/reference name
-- `status`: default keeps only `passed` (override with `--keep-status <label>` or `--keep-status all`)
+- `status`: `passed` is typically used by default; you can override in `porebin normalize` via `--keep-status`
 - `score` (optional): tags like `mapq:60;AS:123` (parsed if present)
 
-Notes:
-- For best streaming/memory usage, `.contacts` should be grouped by `readID`.
-- Output: `out_dir/contacts/contacts.parquet` + `out_dir/contacts/qc.json`.
+Note: for best streaming/memory usage, `.contacts` should be grouped by `readID`.
 
 ### Normalized contacts Parquet (for `porebin build`)
 
@@ -64,7 +73,7 @@ Notes:
 
 ## Pairwise baseline (for papers)
 
-This is a **pairwise normal graph** control built from the same Pore-C data via clique expansion, with fair per-read weights:
+`porebin run --pairwise-baseline` builds a **pairwise normal graph** control via clique expansion, with fair per-read weights:
 - for each read with order `k`, each pair gets `w_pair = 2/(k*(k-1)) = 1/C(k,2)` so that all pairs from that read sum to 1.
 
 Prepare a passed-only contacts file (column 11 must be `passed`):
@@ -73,7 +82,7 @@ Prepare a passed-only contacts file (column 11 must be `passed`):
 awk -F'\t' '$11=="passed"' hyper.merged.contacts > porec.passed.contacts
 ```
 
-The pairwise baseline requires the input to be grouped by readID (column 4). If needed:
+If needed, sort/group by readID (column 4):
 
 ```bash
 sort -k4,4 porec.passed.contacts > porec.passed.sorted.contacts
@@ -106,11 +115,13 @@ printf "r1\t1\tctgB\t1\t2\t+\t.\t.\t.\tmapq:40;AS:7\tpassed\n"  >> demo/example.
 printf "r2\t0\tctgA\t1\t2\t+\t.\t.\t.\tmapq:50;AS:8\tpassed\n"  >> demo/example.contacts
 printf "r2\t1\tctgC\t1\t2\t+\t.\t.\t.\tmapq:50;AS:9\tpassed\n"  >> demo/example.contacts
 
-porebin run --ppl-contacts demo/example.contacts --contigs demo/contigs.fasta --out demo/out --seed 0
+porebin run --ppl-contacts demo/example.contacts --contigs demo/contigs.fasta --out demo/coarse --seed 0
+porebin export --contigs demo/contigs.fasta --bins-tsv demo/coarse/bins.tsv --out demo/final
 ```
 
 Outputs:
-- `demo/out/contacts/contacts.parquet`
-- `demo/out/graph/edges.tsv` etc
-- `demo/out/bins.tsv`
-- `demo/out/bins_fasta/bin_<id>.fasta`
+- `demo/coarse/contacts/contacts.parquet`
+- `demo/coarse/graph/edges.tsv` etc
+- `demo/coarse/bins.tsv`
+- `demo/final/bins_fasta/bin_<id>.fasta` (>=200kb bins only)
+- `demo/final/unbinned.fasta` + `demo/final/unbinned.tsv`

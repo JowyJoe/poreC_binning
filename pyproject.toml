@@ -21,6 +21,9 @@ dependencies = [
 dev = [
   "pytest>=7.0",
 ]
+bam = [
+  "pysam>=0.22",
+]
 
 [project.scripts]
 porebin = "porebin.cli:app"

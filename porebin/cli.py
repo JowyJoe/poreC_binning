@@ -7,9 +7,10 @@ import typer
 from porebin import __version__
 from porebin.build_graph import GraphBuildError, build_graph
 from porebin.cluster import GraphClusterError, cluster_leiden, cluster_leiden_pairwise
-from porebin.export_bins import ExportBinsError, export_bins_fasta
+from porebin.export import ExportError, MIN_BIN_BP, export_bins
 from porebin.normalize import NormalizeError, normalize_contacts
 from porebin.pairwise_baseline import PairwiseBaselineError, build_pairwise_edges
+from porebin.refine import RefineError, refine_bins
 from porebin.utils import (
     console,
     ensure_dir,
@@ -126,15 +127,66 @@ def cluster(
 @app.command()
 def export(
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
-    bins: Path = typer.Option(..., "--bins", help="Bins TSV (out_dir/bins.tsv)."),
+    bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Bins TSV (e.g. coarse/bins.tsv or refined/bins.refined.tsv)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
+    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
 ) -> None:
     out = out.resolve()
-    params = {"contigs": str(contigs), "bins": str(bins), "out": str(out)}
-    with record_run(out, command="export", params=params, seed=None):
+    params = {"contigs": str(contigs), "bins_tsv": str(bins_tsv), "out": str(out), "threads": threads}
+    with record_run(out, command="export", params=params, seed=None) as run_record:
         try:
-            export_bins_fasta(contigs_fasta=contigs, bins_tsv=bins, out_dir=out)
-        except (ExportBinsError, FileNotFoundError) as exc:
+            stats = export_bins(contigs_fasta=contigs, bins_tsv=bins_tsv, out_dir=out, threads=threads)
+            run_record["thresholds"] = {"MIN_BIN_BP": MIN_BIN_BP}
+            run_record["decisions"] = {
+                "export_policy": "keep_bins = total_bp >= MIN_BIN_BP; others -> unbinned.fasta",
+                "min_bin_bp": MIN_BIN_BP,
+                "min_contig_len": stats.min_contig_len,
+                "min_contig_len_ratio_1000_2500_bp": stats.min_contig_len_ratio_1000_2500_bp,
+            }
+            run_record["stats"] = {
+                "contigs_total": stats.contigs_total,
+                "bins_total": stats.bins_total,
+                "bins_kept": stats.bins_kept,
+                "contigs_exported": stats.contigs_exported,
+                "contigs_unbinned": stats.contigs_unbinned,
+            }
+        except (ExportError, FileNotFoundError) as exc:
+            _die(str(exc))
+
+
+@app.command()
+def refine(
+    contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
+    ppl_contacts: Path = typer.Option(..., "--ppl-contacts", help="PPL .contacts TSV file (segment-level)."),
+    bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Coarse bins TSV (e.g. coarse/bins.tsv)."),
+    bam: Path | None = typer.Option(None, "--bam", help="Optional BAM for coverage-aware refine."),
+    out: Path = typer.Option(..., "--out", help="Output directory (refined/)."),
+    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
+    seed: int = typer.Option(0, "--seed", help="Random seed (used for split partition if enabled)."),
+) -> None:
+    out = out.resolve()
+    params = {
+        "contigs": str(contigs),
+        "ppl_contacts": str(ppl_contacts),
+        "bins_tsv": str(bins_tsv),
+        "bam": str(bam) if bam is not None else None,
+        "out": str(out),
+        "threads": threads,
+        "seed": seed,
+    }
+    # refine writes out/run_refine.json with all thresholds and decisions.
+    with record_run(out, command="refine", params=params, seed=seed):
+        try:
+            refine_bins(
+                contigs_fasta=contigs,
+                ppl_contacts=ppl_contacts,
+                bins_tsv=bins_tsv,
+                bam=bam,
+                out_dir=out,
+                threads=threads,
+                seed=seed,
+            )
+        except (RefineError, FileNotFoundError) as exc:
             _die(str(exc))
 
 
@@ -282,13 +334,11 @@ def run(
                     resolution=resolution,
                     seed=seed,
                 )
-            export_bins_fasta(contigs_fasta=contigs, bins_tsv=out / "bins.tsv", out_dir=out)
         except (
             PairwiseBaselineError,
             NormalizeError,
             GraphBuildError,
             GraphClusterError,
-            ExportBinsError,
             FileNotFoundError,
         ) as exc:
             _die(str(exc))
