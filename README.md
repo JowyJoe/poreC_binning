@@ -11,6 +11,7 @@ pip install -e .
 ```
 
 Dependencies (key ones): `pyarrow`, `python-igraph`, `leidenalg`, `typer`, `rich`.
+Optional (experimental spectral coarse clustering): `scipy`, `scikit-learn`.
 
 ### Install (conda, recommended on servers)
 
@@ -51,6 +52,24 @@ porebin refine --contigs contigs.fasta --ppl-contacts porec.contacts --bins-tsv 
 
 # 3) export (built-in min bin size = 200kb)
 porebin export --contigs contigs.fasta --bins-tsv refined/bins.refined.tsv --out final_bins
+```
+
+## Experimental: hypergraph spectral coarse clustering
+
+This branch provides an optional coarse clustering method:
+- `--coarse-method spectral` for `porebin run`
+- `--method spectral` for `porebin cluster`
+
+Install optional deps:
+
+```bash
+pip install -e '.[spectral]'
+```
+
+Run:
+
+```bash
+porebin run --coarse-method spectral --ppl-contacts porec.contacts --contigs contigs.fasta --out coarse_spectral --seed 0
 ```
 
 ## Input formats

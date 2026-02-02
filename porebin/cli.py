@@ -6,7 +6,12 @@ import typer
 
 from porebin import __version__
 from porebin.build_graph import GraphBuildError, build_graph
-from porebin.cluster import GraphClusterError, cluster_leiden, cluster_leiden_pairwise
+from porebin.cluster import (
+    GraphClusterError,
+    cluster_leiden,
+    cluster_leiden_pairwise,
+    cluster_spectral_hypergraph,
+)
 from porebin.export import ExportError, MIN_BIN_BP, export_bins
 from porebin.normalize import NormalizeError, normalize_contacts
 from porebin.pairwise_baseline import PairwiseBaselineError, build_pairwise_edges
@@ -107,19 +112,36 @@ def build(
 def cluster(
     graph: Path = typer.Option(..., "--graph", help="Graph directory (out_dir/graph)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
+    method: str = typer.Option(
+        "leiden",
+        "--method",
+        help="Clustering method: leiden (default) or spectral (experimental hypergraph Laplacian + kmeans).",
+    ),
     resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter."),
     seed: int = typer.Option(0, "--seed", help="Random seed for Leiden."),
 ) -> None:
     out = out.resolve()
-    params = {"graph": str(graph), "out": str(out), "resolution": resolution, "seed": seed}
-    with record_run(out, command="cluster", params=params, seed=seed):
+    params = {"graph": str(graph), "out": str(out), "method": method, "resolution": resolution, "seed": seed}
+    with record_run(out, command="cluster", params=params, seed=seed) as run_record:
         try:
-            cluster_leiden(
-                graph_dir=graph,
-                out_bins_tsv=out / "bins.tsv",
-                resolution=resolution,
-                seed=seed,
-            )
+            m = method.strip().lower()
+            if m == "leiden":
+                cluster_leiden(
+                    graph_dir=graph,
+                    out_bins_tsv=out / "bins.tsv",
+                    resolution=resolution,
+                    seed=seed,
+                )
+                run_record["decisions"] = {"cluster_method": "leiden", "resolution": resolution}
+            elif m == "spectral":
+                meta = cluster_spectral_hypergraph(
+                    graph_dir=graph,
+                    out_bins_tsv=out / "bins.tsv",
+                    seed=seed,
+                )
+                run_record["decisions"] = {"cluster_method": "spectral", **meta}
+            else:
+                _die(f"Unknown --method {method!r}. Use 'leiden' or 'spectral'.")
         except (GraphClusterError, FileNotFoundError) as exc:
             _die(str(exc))
 
@@ -230,6 +252,11 @@ def run(
         "pair", "--order-norm", help="OrderNorm: pair (2/(k*(k-1))) or star (1/(k-1))."
     ),
     parquet_batch_size: int = typer.Option(100_000, "--parquet-batch-size", help="Parquet batch size."),
+    coarse_method: str = typer.Option(
+        "leiden",
+        "--coarse-method",
+        help="Coarse clustering method for hypergraph pipeline: leiden (default) or spectral (experimental).",
+    ),
 ) -> None:
     out = out.resolve()
     params = {
@@ -247,10 +274,13 @@ def run(
         "assume_no_header": assume_no_header,
         "order_norm_method": order_norm_method,
         "parquet_batch_size": parquet_batch_size,
+        "coarse_method": coarse_method,
     }
-    with record_run(out, command="run", params=params, seed=seed):
+    with record_run(out, command="run", params=params, seed=seed) as run_record:
         try:
             if pairwise_baseline:
+                if coarse_method.strip().lower() != "leiden":
+                    raise GraphClusterError("--coarse-method only applies to the hypergraph pipeline (without --pairwise-baseline).")
                 graph_dir = out / "graph"
                 ensure_dir(graph_dir)
 
@@ -312,6 +342,7 @@ def run(
                     resolution=resolution,
                     seed=seed,
                 )
+                run_record["decisions"] = {"cluster_method": "leiden_pairwise", "resolution": resolution}
             else:
                 contacts_parquet = normalize_contacts(
                     ppl_contacts=ppl_contacts,
@@ -328,12 +359,24 @@ def run(
                     order_norm_method=order_norm_method,
                     parquet_batch_size=parquet_batch_size,
                 )
-                cluster_leiden(
-                    graph_dir=out / "graph",
-                    out_bins_tsv=out / "bins.tsv",
-                    resolution=resolution,
-                    seed=seed,
-                )
+                m = coarse_method.strip().lower()
+                if m == "leiden":
+                    cluster_leiden(
+                        graph_dir=out / "graph",
+                        out_bins_tsv=out / "bins.tsv",
+                        resolution=resolution,
+                        seed=seed,
+                    )
+                    run_record["decisions"] = {"cluster_method": "leiden", "resolution": resolution}
+                elif m == "spectral":
+                    meta = cluster_spectral_hypergraph(
+                        graph_dir=out / "graph",
+                        out_bins_tsv=out / "bins.tsv",
+                        seed=seed,
+                    )
+                    run_record["decisions"] = {"cluster_method": "spectral", **meta}
+                else:
+                    raise GraphClusterError(f"Unknown --coarse-method {coarse_method!r}. Use 'leiden' or 'spectral'.")
         except (
             PairwiseBaselineError,
             NormalizeError,

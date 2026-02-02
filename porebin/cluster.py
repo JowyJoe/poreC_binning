@@ -72,6 +72,133 @@ def cluster_leiden(
     logger.info(f"Wrote bins: {out_bins_tsv}")
 
 
+def cluster_spectral_hypergraph(
+    *,
+    graph_dir: Path,
+    out_bins_tsv: Path,
+    seed: int = 0,
+    logger: Optional[logging.Logger] = None,
+) -> dict:
+    """
+    Hypergraph spectral clustering using a Zhou-style normalized hypergraph Laplacian.
+
+    We treat the contig-contact bipartite incidence as a hypergraph incidence matrix H,
+    with hyperedge weights already encoded by `edges.tsv` weights (typically OrderNorm(k)*weight).
+    We compute:
+      A = H * D_e^{-1} * H^T   (contig-contig "2-step" similarity)
+      S = D_v^{-1/2} * A * D_v^{-1/2}
+      L = I - S
+    Then run k-means on the first K eigenvectors of L (K chosen by an eigengap heuristic).
+
+    This is an experimental coarse clustering alternative to Leiden.
+    """
+    logger = logger or logging.getLogger("porebin")
+    graph_dir = graph_dir.resolve()
+    out_bins_tsv = out_bins_tsv.resolve()
+
+    contig_names = _read_contig_index(graph_dir / "contig_index.tsv")
+    if not contig_names:
+        raise GraphClusterError(f"No contigs found in {graph_dir / 'contig_index.tsv'}")
+
+    meta = _read_graph_meta(graph_dir / "graph_meta.json")
+    num_contigs = len(contig_names)
+    num_contacts = int(meta.get("num_contacts", 0))
+    if num_contacts <= 0:
+        raise GraphClusterError(f"Invalid num_contacts in {graph_dir / 'graph_meta.json'}: {num_contacts}")
+
+    rows, cols, data = _read_incidence(graph_dir / "edges.tsv")
+    if not rows:
+        raise GraphClusterError(f"No edges found in {graph_dir / 'edges.tsv'}")
+
+    try:
+        import numpy as np
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+        from sklearn.cluster import KMeans
+    except Exception as exc:  # pragma: no cover
+        raise GraphClusterError(
+            "spectral clustering requires optional dependencies: scipy, scikit-learn. "
+            "Install them (e.g. pip install 'porebin[spectral]' or conda install scipy scikit-learn)."
+        ) from exc
+
+    logger.info(
+        "Spectral clustering hypergraph incidence: contigs=%s, contacts=%s, incidences=%s",
+        num_contigs,
+        num_contacts,
+        len(rows),
+    )
+
+    H = sp.coo_matrix((np.asarray(data, dtype=float), (np.asarray(rows), np.asarray(cols))), shape=(num_contigs, num_contacts)).tocsr()
+
+    dv = np.asarray(H.sum(axis=1)).ravel()
+    if not np.any(dv > 0):
+        raise GraphClusterError("All contigs have zero incidence degree; cannot run spectral clustering.")
+    de = np.asarray(H.sum(axis=0)).ravel()
+    if not np.any(de > 0):
+        raise GraphClusterError("All contacts have zero incidence degree; cannot run spectral clustering.")
+
+    # A = H * D_e^{-1} * H^T
+    de_inv = np.zeros_like(de, dtype=float)
+    nz = de > 0
+    de_inv[nz] = 1.0 / de[nz]
+    A = H.multiply(de_inv) @ H.T
+    A.setdiag(0.0)
+    A.eliminate_zeros()
+
+    dv_inv_sqrt = np.zeros_like(dv, dtype=float)
+    nzv = dv > 0
+    dv_inv_sqrt[nzv] = 1.0 / np.sqrt(dv[nzv])
+    Dv_inv_sqrt = sp.diags(dv_inv_sqrt, format="csr")
+    S = Dv_inv_sqrt @ A @ Dv_inv_sqrt
+
+    # L = I - S
+    L = sp.eye(num_contigs, format="csr") - S
+
+    # Compute a small spectral basis; K will be chosen via eigengap.
+    # Keep this conservative/fast by default.
+    max_eigs = 50
+    k_eigs = min(max_eigs, max(2, num_contigs - 1))
+    try:
+        evals, evecs = spla.eigsh(L, k=k_eigs, which="SA")
+    except Exception as exc:
+        raise GraphClusterError(f"eigsh failed on hypergraph Laplacian (n={num_contigs}, k={k_eigs}).") from exc
+
+    order = np.argsort(evals)
+    evals = evals[order]
+    evecs = evecs[:, order]
+
+    K, k_meta = _choose_k_by_eigengap(evals, conservative=True)
+    K = int(min(max(2, K), evecs.shape[1]))
+
+    X = evecs[:, :K]
+    # Row-normalize embedding.
+    row_norm = np.linalg.norm(X, axis=1, keepdims=True)
+    row_norm[row_norm == 0] = 1.0
+    X = X / row_norm
+
+    km = KMeans(n_clusters=K, n_init=10, random_state=seed)
+    labels = km.fit_predict(X)
+
+    logger.info("Spectral clustering chose K=%s (%s)", K, k_meta.get("method", "eigengap"))
+
+    out_bins_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with out_bins_tsv.open("w", encoding="utf-8", newline="") as fh:
+        fh.write("contig_name\tbin_id\n")
+        for name, bin_id in zip(contig_names, labels.tolist(), strict=True):
+            fh.write(f"{name}\t{bin_id}\n")
+
+    logger.info(f"Wrote bins: {out_bins_tsv}")
+
+    return {
+        "method": "spectral_hypergraph_laplacian",
+        "laplacian": "L = I - Dv^{-1/2} * (H * De^{-1} * H^T) * Dv^{-1/2}",
+        "k_selected": K,
+        "k_selection": k_meta,
+        "n_eigs": int(k_eigs),
+        "seed": seed,
+    }
+
+
 def cluster_leiden_pairwise(
     *,
     contig_index_tsv: Path,
@@ -220,3 +347,67 @@ def _read_edges(path: Path, *, contig_offset: int) -> tuple[list[tuple[int, int]
             edges.append((c_idx, contig_offset + contact_idx))
             weights.append(w)
     return edges, weights
+
+
+def _read_incidence(path: Path) -> tuple[list[int], list[int], list[float]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing edges file: {path}")
+
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        for row in reader:
+            if not row:
+                continue
+            if row[0] == "contig_idx":
+                continue
+            if len(row) < 3:
+                raise GraphClusterError(f"Invalid edge row in {path}: {row}")
+            try:
+                c_idx = int(row[0])
+                contact_idx = int(row[1])
+                w = float(row[2])
+            except ValueError as exc:
+                raise GraphClusterError(f"Invalid edge row in {path}: {row}") from exc
+            rows.append(c_idx)
+            cols.append(contact_idx)
+            data.append(w)
+    return rows, cols, data
+
+
+def _choose_k_by_eigengap(evals, *, conservative: bool) -> tuple[int, dict]:
+    """
+    Pick K clusters from ascending Laplacian eigenvalues via eigengap.
+
+    conservative=True chooses the *largest* K whose eigengap is close to the maximum gap,
+    which tends to avoid overly coarse (potentially mixed) clusters.
+    """
+    import numpy as np
+
+    vals = np.asarray(evals, dtype=float)
+    if vals.size < 3:
+        return 2, {"method": "fallback_small_n", "n_eigs": int(vals.size)}
+
+    # gaps between consecutive eigenvalues; K corresponds to the index AFTER the gap.
+    gaps = np.diff(vals)
+    # ignore the first gap at i=0 (often near 0), consider K >= 2
+    start = 1
+    if gaps.size <= start:
+        return 2, {"method": "fallback_no_gaps", "n_eigs": int(vals.size)}
+
+    usable = gaps[start:]
+    max_gap = float(np.max(usable))
+    if max_gap <= 0:
+        return 2, {"method": "fallback_nonpos_gap", "max_gap": max_gap, "n_eigs": int(vals.size)}
+
+    ratio = 0.8 if conservative else 1.0
+    candidates = np.where(gaps >= (ratio * max_gap))[0]
+    candidates = candidates[candidates >= start]
+    if candidates.size == 0:
+        i = int(np.argmax(usable) + start)
+        return i + 1, {"method": "eigengap_argmax", "gap_ratio": ratio, "max_gap": max_gap, "n_eigs": int(vals.size)}
+
+    i = int(np.max(candidates) if conservative else np.min(candidates))
+    return i + 1, {"method": "eigengap_conservative" if conservative else "eigengap", "gap_ratio": ratio, "max_gap": max_gap, "n_eigs": int(vals.size)}
