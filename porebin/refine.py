@@ -143,8 +143,16 @@ def refine_bins(
 
         cov: Optional[dict[str, float]] = None
         bin_cov_stats: Optional[dict[str, dict[str, float]]] = None
+        coverage_source_meta: Optional[dict[str, Any]] = None
         if bam is not None:
-            cov = _coverage_from_bam(bam, contig_len, min_contig_len=min_contig_len, logger=logger)
+            cov_tsv = bins_tsv.parent / "coverage" / "coverage.tsv"
+            if cov_tsv.exists():
+                logger.info(f"Refine: using cached coverage TSV: {cov_tsv}")
+                cov = _coverage_from_tsv(cov_tsv, contig_len=contig_len, min_contig_len=min_contig_len)
+                coverage_source_meta = {"type": "coverage_tsv", "path": str(cov_tsv)}
+            else:
+                cov = _coverage_from_bam(bam, contig_len, min_contig_len=min_contig_len, logger=logger)
+                coverage_source_meta = {"type": "bam_scan", "bam": str(bam)}
             bin_cov_stats = _bin_coverage_stats(bin_to_contigs, cov)
 
         intra, other, affinity, contact_meta = _scan_contacts_support_and_affinity(
@@ -232,6 +240,7 @@ def refine_bins(
         record["decisions"] = {
             "status_filter": "passed",
             "order_norm": "2/(k*(k-1))  # == 1/C(k,2)",
+            "coverage_source": coverage_source_meta,
             "keep_bins_rule": "total_bp >= 200kb",
             "recruit": {
                 "topK": 3,
@@ -395,6 +404,32 @@ def _coverage_from_bam(
         if L < min_contig_len:
             continue
         cov[contig] = aligned_bases.get(contig, 0) / float(L) if L else 0.0
+    return cov
+
+
+def _coverage_from_tsv(
+    path: Path,
+    *,
+    contig_len: dict[str, int],
+    min_contig_len: int,
+) -> dict[str, float]:
+    cov: dict[str, float] = {}
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        for row in reader:
+            if not row:
+                continue
+            if row[0] in {"contig_name", "contig"}:
+                continue
+            if len(row) < 2:
+                continue
+            name = row[0].strip()
+            if contig_len.get(name, 0) < min_contig_len:
+                continue
+            try:
+                cov[name] = float(row[1])
+            except ValueError:
+                continue
     return cov
 
 

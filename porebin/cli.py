@@ -115,13 +115,25 @@ def cluster(
     method: str = typer.Option(
         "leiden",
         "--method",
-        help="Clustering method: leiden (default) or spectral (experimental hypergraph Laplacian + kmeans).",
+        help="Clustering method: leiden (default) or spectral (experimental hypergraph Laplacian).",
     ),
     resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter."),
     seed: int = typer.Option(0, "--seed", help="Random seed for Leiden."),
+    bam: Path | None = typer.Option(
+        None,
+        "--bam",
+        help="Optional BAM (spectral only): enables coverage-guided divisive spectral bisection (no fixed K).",
+    ),
 ) -> None:
     out = out.resolve()
-    params = {"graph": str(graph), "out": str(out), "method": method, "resolution": resolution, "seed": seed}
+    params = {
+        "graph": str(graph),
+        "out": str(out),
+        "method": method,
+        "resolution": resolution,
+        "seed": seed,
+        "bam": str(bam) if bam is not None else None,
+    }
     with record_run(out, command="cluster", params=params, seed=seed) as run_record:
         try:
             m = method.strip().lower()
@@ -138,6 +150,7 @@ def cluster(
                     graph_dir=graph,
                     out_bins_tsv=out / "bins.tsv",
                     seed=seed,
+                    bam=bam,
                 )
                 run_record["decisions"] = {"cluster_method": "spectral", **meta}
             else:
@@ -217,6 +230,11 @@ def run(
     ppl_contacts: Path = typer.Option(..., "--ppl-contacts", help="PPL .contacts TSV file."),
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
+    bam: Path | None = typer.Option(
+        None,
+        "--bam",
+        help="Optional BAM (spectral coarse only): enables coverage-guided divisive spectral bisection.",
+    ),
     pairwise_baseline: bool = typer.Option(
         False,
         "--pairwise-baseline",
@@ -263,6 +281,7 @@ def run(
         "ppl_contacts": str(ppl_contacts),
         "contigs": str(contigs),
         "out": str(out),
+        "bam": str(bam) if bam is not None else None,
         "pairwise_baseline": pairwise_baseline,
         "resolution": resolution,
         "seed": seed,
@@ -373,6 +392,7 @@ def run(
                         graph_dir=out / "graph",
                         out_bins_tsv=out / "bins.tsv",
                         seed=seed,
+                        bam=bam,
                     )
                     run_record["decisions"] = {"cluster_method": "spectral", **meta}
                 else:
