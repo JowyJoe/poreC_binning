@@ -26,7 +26,6 @@ bam = [
 ]
 spectral = [
   "scipy>=1.10",
-  "scikit-learn>=1.3",
 ]
 
 [project.scripts]

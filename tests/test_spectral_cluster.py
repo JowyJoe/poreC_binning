@@ -10,6 +10,14 @@ def _write_graph_dir(tmp_path: Path) -> Path:
     graph_dir = tmp_path / "graph"
     graph_dir.mkdir(parents=True, exist_ok=True)
 
+    contigs_fasta = tmp_path / "contigs.fasta"
+    # Keep lengths >= MIN_BIN_BP/2 so two-contig components form valid bins.
+    L = 120_000
+    contigs_fasta.write_text(
+        f">A\n{'A' * L}\n>B\n{'C' * L}\n>C\n{'G' * L}\n>D\n{'T' * L}\n",
+        encoding="utf-8",
+    )
+
     (graph_dir / "contig_index.tsv").write_text(
         "contig_name\tcontig_idx\nA\t0\nB\t1\nC\t2\nD\t3\n",
         encoding="utf-8",
@@ -29,14 +37,13 @@ def _write_graph_dir(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
 
-    meta = {"num_contigs": 4, "num_contacts": 4, "num_edges": 8}
+    meta = {"num_contigs": 4, "num_contacts": 4, "num_edges": 8, "input_contigs_fasta": str(contigs_fasta)}
     (graph_dir / "graph_meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return graph_dir
 
 
 def test_cluster_spectral_hypergraph_two_components(tmp_path: Path) -> None:
     pytest.importorskip("scipy", reason="spectral optional deps not installed")
-    pytest.importorskip("sklearn", reason="spectral optional deps not installed")
 
     from porebin.cluster import cluster_spectral_hypergraph
 

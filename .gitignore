@@ -22,5 +22,6 @@ logs/
 .DS_Store
 Thumbs.db
 
-# documentation
-docs/
+# documentation (track Markdown)
+docs/*
+!docs/*.md

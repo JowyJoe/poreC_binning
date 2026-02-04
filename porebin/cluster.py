@@ -86,19 +86,19 @@ def cluster_spectral_hypergraph(
     logger: Optional[logging.Logger] = None,
 ) -> dict:
     """
-    Hypergraph spectral clustering using a Zhou-style normalized hypergraph Laplacian.
+    Hypergraph spectral clustering via a Zhou-style normalized hypergraph Laplacian.
 
     We treat the contig-contact bipartite incidence as a hypergraph incidence matrix H,
-    with hyperedge weights already encoded by `edges.tsv` weights (typically OrderNorm(k)*weight).
-    We compute:
-      A = H * D_e^{-1} * H^T   (contig-contig "2-step" similarity)
-      S = D_v^{-1/2} * A * D_v^{-1/2}
-      L = I - S
-    Default (no BAM): run k-means on the first K eigenvectors of L (K chosen by an eigengap heuristic).
+    where hyperedge weights are already encoded by `edges.tsv` weights (typically OrderNorm(k)*weight*P_{r,c}).
+    We compute the contig-contig similarity:
+      A = H * D_e^{-1} * H^T
 
-    If `bam` is provided: run divisive (top-down) spectral bisection, using BAM coverage BIC (1-Gaussian vs 2-GMM
-    on log1p coverage) as an automatic "stop" signal (no user thresholds). Small splits are discarded using the
-    same 200kb minimum bin size as export/refine.
+    Clustering is done by top-down spectral bisection on A:
+      - Always: split if a 2-block graph model fits better than 1-block (BIC on edge presence).
+      - If `bam` (or cached coverage TSV) is available: additionally split if coverage is multi-modal
+        (BIC: 1-Gaussian vs 2-GMM on log1p coverage).
+      - Disconnected components are split parameter-free.
+      - Clusters below the 200kb minimum bin size are treated as unbinned (aligns with export/refine).
 
     This is an experimental coarse clustering alternative to Leiden.
     """
@@ -124,12 +124,10 @@ def cluster_spectral_hypergraph(
     try:
         import numpy as np
         import scipy.sparse as sp
-        import scipy.sparse.linalg as spla
-        from sklearn.cluster import KMeans
     except Exception as exc:  # pragma: no cover
         raise GraphClusterError(
-            "spectral clustering requires optional dependencies: scipy, scikit-learn. "
-            "Install them (e.g. pip install 'porebin[spectral]' or conda install scipy scikit-learn)."
+            "spectral clustering requires optional dependency: scipy. "
+            "Install it (e.g. pip install 'porebin[spectral]' or conda install scipy)."
         ) from exc
 
     logger.info(
@@ -156,123 +154,89 @@ def cluster_spectral_hypergraph(
     A.setdiag(0.0)
     A.eliminate_zeros()
 
-    if bam is not None:
-        contigs_fasta_s = meta.get("input_contigs_fasta")
-        contigs_fasta = Path(contigs_fasta_s).expanduser().resolve() if contigs_fasta_s else None
-        if contigs_fasta is None or not contigs_fasta.exists():
-            raise GraphClusterError(
-                "Spectral clustering with BAM needs the original contigs FASTA path in graph_meta.json (input_contigs_fasta). "
-                f"Got: {contigs_fasta_s!r}"
-            )
+    # contig lengths are used for (a) filtering very short contigs and (b) bin-size gating.
+    contigs_fasta_s = meta.get("input_contigs_fasta")
+    contigs_fasta = Path(contigs_fasta_s).expanduser().resolve() if contigs_fasta_s else None
+    if contigs_fasta is None or not contigs_fasta.exists():
+        raise GraphClusterError(
+            "Spectral clustering requires the original contigs FASTA path in graph_meta.json (input_contigs_fasta). "
+            f"Got: {contigs_fasta_s!r}"
+        )
 
-        contig_len = _read_contig_lengths(contigs_fasta)
-        if not contig_len:
-            raise GraphClusterError(f"No contigs found in FASTA: {contigs_fasta}")
+    contig_len = _read_contig_lengths(contigs_fasta)
+    if not contig_len:
+        raise GraphClusterError(f"No contigs found in FASTA: {contigs_fasta}")
 
-        lengths = np.asarray([contig_len.get(n, 0) for n in contig_names], dtype=int)
-        min_contig_len, min_contig_len_meta = _auto_min_contig_len(lengths)
-        keep_mask = lengths >= min_contig_len
-        keep_idx = np.where(keep_mask)[0]
-        if keep_idx.size < 2:
-            raise GraphClusterError(
-                f"Too few contigs >= MIN_CONTIG_LEN={min_contig_len} for spectral clustering (n={keep_idx.size})."
-            )
+    lengths = np.asarray([contig_len.get(n, 0) for n in contig_names], dtype=int)
+    min_contig_len, min_contig_len_meta = _auto_min_contig_len(lengths)
+    keep_mask = (lengths >= int(min_contig_len)) & (dv > 0)
+    keep_idx = np.where(keep_mask)[0]
+    if keep_idx.size < 2:
+        raise GraphClusterError(
+            f"Too few contigs with contacts and length >= MIN_CONTIG_LEN={min_contig_len} for spectral clustering (n={keep_idx.size})."
+        )
 
+    # Optional coverage (BAM scan OR cached coverage TSV if present).
+    cov_arr = None
+    cov_out = out_bins_tsv.parent / "coverage" / "coverage.tsv"
+    cov: Optional[dict[str, float]] = None
+    coverage_source: Optional[dict] = None
+    if cov_out.exists():
+        cov = _coverage_from_tsv(cov_out, contig_len=contig_len, min_contig_len=min_contig_len)
+        coverage_source = {"type": "coverage_tsv", "path": str(cov_out)}
+    elif bam is not None:
         if not bam.exists():
             raise FileNotFoundError(f"BAM not found: {bam}")
-        cov = _coverage_from_bam(bam, contig_names=contig_names, contig_len=contig_len, min_contig_len=min_contig_len, logger=logger)
-        cov_arr = np.asarray([cov.get(n, 0.0) for n in contig_names], dtype=float)
+        cov = _coverage_from_bam(
+            bam, contig_names=contig_names, contig_len=contig_len, min_contig_len=min_contig_len, logger=logger
+        )
+        coverage_source = {"type": "bam_scan", "bam": str(bam)}
 
         # Cache coverage for later refine (avoid scanning BAM twice).
-        cov_out = out_bins_tsv.parent / "coverage" / "coverage.tsv"
         cov_out.parent.mkdir(parents=True, exist_ok=True)
         with cov_out.open("w", encoding="utf-8", newline="") as fh:
             fh.write("contig_name\tcoverage\n")
-            for i, name in enumerate(contig_names):
+            for name in contig_names:
                 if contig_len.get(name, 0) >= min_contig_len:
-                    fh.write(f"{name}\t{cov_arr[i]:.12g}\n")
+                    fh.write(f"{name}\t{cov.get(name, 0.0):.12g}\n")
 
-        labels_keep, meta_bisect = _divisive_bisect_by_coverage_bic(
-            A=A[keep_idx][:, keep_idx].tocsr(),
-            contig_names=[contig_names[i] for i in keep_idx.tolist()],
-            lengths=lengths[keep_idx],
-            coverage=cov_arr[keep_idx],
-            seed=seed,
-            logger=logger,
-        )
+    if cov is not None:
+        cov_arr = np.asarray([cov.get(n, 0.0) for n in contig_names], dtype=float)
 
-        out_bins_tsv.parent.mkdir(parents=True, exist_ok=True)
-        with out_bins_tsv.open("w", encoding="utf-8", newline="") as fh:
-            fh.write("contig_name\tbin_id\n")
-            for i, b in enumerate(labels_keep):
-                if b is None:
-                    continue
-                fh.write(f"{contig_names[keep_idx[i]]}\t{b}\n")
-
-        logger.info(f"Wrote bins: {out_bins_tsv}")
-        return {
-            "method": "spectral_hypergraph_bisection",
-            "laplacian": "L = I - Dv^{-1/2} * (H * De^{-1} * H^T) * Dv^{-1/2}",
-            "seed": seed,
-            "min_contig_len": int(min_contig_len),
-            "min_contig_len_method": min_contig_len_meta,
-            "min_bin_bp": int(MIN_BIN_BP),
-            "stop_rule": "split if BIC2 < BIC1 on log1p(coverage), else stop",
-            "coverage_tsv": str(cov_out),
-            **meta_bisect,
-        }
-
-    dv_inv_sqrt = np.zeros_like(dv, dtype=float)
-    nzv = dv > 0
-    dv_inv_sqrt[nzv] = 1.0 / np.sqrt(dv[nzv])
-    Dv_inv_sqrt = sp.diags(dv_inv_sqrt, format="csr")
-    S = Dv_inv_sqrt @ A @ Dv_inv_sqrt
-
-    # L = I - S
-    L = sp.eye(num_contigs, format="csr") - S
-
-    # Compute a small spectral basis; K will be chosen via eigengap.
-    # Keep this conservative/fast by default.
-    max_eigs = 50
-    k_eigs = min(max_eigs, max(2, num_contigs - 1))
-    try:
-        evals, evecs = spla.eigsh(L, k=k_eigs, which="SA")
-    except Exception as exc:
-        raise GraphClusterError(f"eigsh failed on hypergraph Laplacian (n={num_contigs}, k={k_eigs}).") from exc
-
-    order = np.argsort(evals)
-    evals = evals[order]
-    evecs = evecs[:, order]
-
-    K, k_meta = _choose_k_by_eigengap(evals, conservative=True)
-    K = int(min(max(2, K), evecs.shape[1]))
-
-    X = evecs[:, :K]
-    # Row-normalize embedding.
-    row_norm = np.linalg.norm(X, axis=1, keepdims=True)
-    row_norm[row_norm == 0] = 1.0
-    X = X / row_norm
-
-    km = KMeans(n_clusters=K, n_init=10, random_state=seed)
-    labels = km.fit_predict(X)
-
-    logger.info("Spectral clustering chose K=%s (%s)", K, k_meta.get("method", "eigengap"))
+    labels_keep, meta_bisect = _divisive_bisect_by_auto_bic(
+        A=A[keep_idx][:, keep_idx].tocsr(),
+        lengths=lengths[keep_idx],
+        coverage=(cov_arr[keep_idx] if cov_arr is not None else None),
+        seed=seed,
+        logger=logger,
+        discard_small=True,
+    )
 
     out_bins_tsv.parent.mkdir(parents=True, exist_ok=True)
     with out_bins_tsv.open("w", encoding="utf-8", newline="") as fh:
         fh.write("contig_name\tbin_id\n")
-        for name, bin_id in zip(contig_names, labels.tolist(), strict=True):
-            fh.write(f"{name}\t{bin_id}\n")
+        for i, b in enumerate(labels_keep):
+            if b is None:
+                continue
+            fh.write(f"{contig_names[keep_idx[i]]}\t{b}\n")
 
     logger.info(f"Wrote bins: {out_bins_tsv}")
 
+    stop_rule = "split if graph_BIC(2-block) < graph_BIC(1-block)"
+    if cov_arr is not None:
+        stop_rule += " OR coverage_BIC(2-GMM) < coverage_BIC(1-Gauss) on log1p(cov)"
+
     return {
-        "method": "spectral_hypergraph_laplacian",
+        "method": "spectral_hypergraph_bisection_auto_bic",
         "laplacian": "L = I - Dv^{-1/2} * (H * De^{-1} * H^T) * Dv^{-1/2}",
-        "k_selected": K,
-        "k_selection": k_meta,
-        "n_eigs": int(k_eigs),
         "seed": seed,
+        "min_contig_len": int(min_contig_len),
+        "min_contig_len_method": min_contig_len_meta,
+        "min_bin_bp": int(MIN_BIN_BP),
+        "stop_rule": stop_rule,
+        "coverage_source": coverage_source,
+        "coverage_tsv": (str(cov_out) if cov_out.exists() else None),
+        **meta_bisect,
     }
 
 
@@ -566,6 +530,297 @@ def _coverage_from_bam(
     return cov
 
 
+def _coverage_from_tsv(
+    path: Path,
+    *,
+    contig_len: dict[str, int],
+    min_contig_len: int,
+) -> dict[str, float]:
+    cov: dict[str, float] = {}
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh, delimiter="\t")
+        for row in reader:
+            if not row:
+                continue
+            if row[0] in {"contig_name", "contig"}:
+                continue
+            if len(row) < 2:
+                continue
+            name = row[0].strip()
+            if contig_len.get(name, 0) < min_contig_len:
+                continue
+            try:
+                cov[name] = float(row[1])
+            except ValueError:
+                continue
+    return cov
+
+
+def _graph_bic_trigger(A_sub, *, left, right) -> tuple[bool, dict]:
+    """
+    Decide whether to split based on a simple 1-block vs 2-block Bernoulli graph model (BIC) on edge presence.
+
+    Observation model: for each unordered pair (i<j), x_ij = 1 if A_ij > 0 else 0.
+      - 1-block: x_ij ~ Bernoulli(p0)
+      - 2-block: x_ij ~ Bernoulli(p_in) if same side else Bernoulli(p_out)
+    Trigger if BIC_2 < BIC_1.
+    """
+    import numpy as np
+
+    A_sub = A_sub.tocsr()
+    n = int(A_sub.shape[0])
+    left = np.asarray(left, dtype=int)
+    right = np.asarray(right, dtype=int)
+    if left.size + right.size != n:
+        return False, {"type": "skip_bad_partition", "n": n}
+
+    n0 = int(left.size)
+    n1 = int(right.size)
+    n_total = n * (n - 1) // 2
+    n_in = (n0 * (n0 - 1) // 2) + (n1 * (n1 - 1) // 2)
+    n_out = n0 * n1
+    if n_total <= 0 or n_out <= 0:
+        return False, {"type": "skip_too_small", "n": n, "n0": n0, "n1": n1}
+
+    # side[i] in {0,1}
+    side = np.zeros(n, dtype=np.int8)
+    side[right] = 1
+
+    m_in = 0
+    m_out = 0
+    indptr = A_sub.indptr
+    indices = A_sub.indices
+    for i in range(n):
+        si = int(side[i])
+        for j in indices[int(indptr[i]) : int(indptr[i + 1])]:
+            j = int(j)
+            if j <= i:
+                continue
+            if int(side[j]) == si:
+                m_in += 1
+            else:
+                m_out += 1
+    m_total = m_in + m_out
+
+    def clamp_prob(p: float, eps: float = 1e-12) -> float:
+        if p < eps:
+            return eps
+        if p > 1.0 - eps:
+            return 1.0 - eps
+        return p
+
+    p0 = clamp_prob(m_total / n_total)
+    pin = clamp_prob(m_in / n_in) if n_in > 0 else p0
+    pout = clamp_prob(m_out / n_out)
+
+    ll1 = m_total * math.log(p0) + (n_total - m_total) * math.log(1.0 - p0)
+    ll2 = (
+        m_in * math.log(pin)
+        + (n_in - m_in) * math.log(1.0 - pin)
+        + m_out * math.log(pout)
+        + (n_out - m_out) * math.log(1.0 - pout)
+    )
+
+    bic1 = -2.0 * ll1 + 1.0 * math.log(n_total)
+    bic2 = -2.0 * ll2 + 2.0 * math.log(n_total)
+    return (bic2 < bic1), {
+        "type": "bic_1v2_bernoulli_edge_presence",
+        "n": n,
+        "n0": n0,
+        "n1": n1,
+        "m_total": int(m_total),
+        "m_in": int(m_in),
+        "m_out": int(m_out),
+        "p0": float(p0),
+        "p_in": float(pin),
+        "p_out": float(pout),
+        "bic1": float(bic1),
+        "bic2": float(bic2),
+        "delta": float(bic1 - bic2),
+    }
+
+
+def _divisive_bisect_by_auto_bic(
+    *,
+    A,
+    lengths,
+    coverage,
+    seed: int,
+    logger: logging.Logger,
+    discard_small: bool,
+) -> tuple[list[Optional[int]], dict]:
+    """
+    Top-down spectral bisection on the contig-contig similarity graph.
+
+    Stop rule (automatic, no user thresholds):
+      - Split if graph_BIC(2-block) < graph_BIC(1-block) on edge presence, OR
+      - If coverage is provided: split if coverage_BIC(2-GMM) < coverage_BIC(1-Gauss) on log1p(coverage).
+
+    Disconnected components are always split (parameter-free).
+
+    discard_small=True: clusters with total_bp < MIN_BIN_BP are treated as unbinned (labels=None).
+    discard_small=False: small clusters are kept but are not split further.
+    """
+    import numpy as np
+    import scipy.sparse.csgraph as csgraph
+
+    A = A.tocsr()
+    n = int(A.shape[0])
+
+    lens = np.asarray(lengths, dtype=int)
+    if lens.size != n:
+        raise GraphClusterError("Internal error: lengths array does not match A shape.")
+    cov = np.asarray(coverage, dtype=float) if coverage is not None else None
+
+    labels: list[Optional[int]] = [None] * n
+    final_clusters: list[np.ndarray] = []
+
+    splits_attempted = 0
+    splits_accepted = 0
+    component_splits = 0
+    graph_bic_triggered = 0
+    coverage_bic_triggered = 0
+    stopped_unimodal = 0
+    stopped_small = 0
+    max_depth = 0
+
+    graph_bic_top: list[dict] = []
+
+    # Stack items are (indices, depth)
+    stack: list[tuple[np.ndarray, int]] = [(np.arange(n, dtype=int), 0)]
+    while stack:
+        idx, depth = stack.pop()
+        max_depth = max(max_depth, depth)
+        if idx.size < 2:
+            if discard_small:
+                stopped_small += 1
+                continue
+            final_clusters.append(idx)
+            continue
+
+        bp = int(np.sum(lens[idx]))
+        if bp < MIN_BIN_BP and discard_small:
+            stopped_small += 1
+            continue
+
+        # Induced adjacency for this cluster
+        A_sub = A[idx][:, idx].tocsr()
+        if A_sub.nnz == 0:
+            if discard_small:
+                stopped_small += 1
+                continue
+            final_clusters.append(idx)
+            continue
+
+        # If already disconnected, split by components (parameter-free). If all components are too small,
+        # revoke and keep the parent cluster.
+        n_comp, comp = csgraph.connected_components(A_sub, directed=False, return_labels=True)
+        if n_comp > 1:
+            comps: list[np.ndarray] = [idx[np.where(comp == c)[0]] for c in range(n_comp)]
+            big = [c for c in comps if int(np.sum(lens[c])) >= MIN_BIN_BP]
+            if discard_small and not big:
+                final_clusters.append(idx)
+                continue
+            component_splits += 1
+            splits_accepted += 1
+            for sub in comps:
+                if sub.size >= 1:
+                    stack.append((sub, depth + 1))
+            continue
+
+        # coverage trigger (optional)
+        cov_trig = False
+        if cov is not None:
+            cov_trig, _cov_meta = _coverage_bic_trigger(cov[idx])
+            if cov_trig:
+                coverage_bic_triggered += 1
+
+        splits_attempted += 1
+        left_local, right_local, split_meta = _spectral_sweep_bisect(A_sub, seed=seed)
+        if left_local.size == 0 or right_local.size == 0:
+            stopped_unimodal += 1
+            final_clusters.append(idx)
+            continue
+
+        graph_trig, graph_meta = _graph_bic_trigger(A_sub, left=left_local, right=right_local)
+        if graph_meta.get("type") == "bic_1v2_bernoulli_edge_presence":
+            graph_bic_top.append(
+                {
+                    "n": int(graph_meta.get("n", 0)),
+                    "delta": float(graph_meta.get("delta", 0.0)),
+                    "p_in": float(graph_meta.get("p_in", 0.0)),
+                    "p_out": float(graph_meta.get("p_out", 0.0)),
+                }
+            )
+            graph_bic_top.sort(key=lambda x: x["delta"], reverse=True)
+            if len(graph_bic_top) > 50:
+                graph_bic_top.pop()
+
+        if graph_trig:
+            graph_bic_triggered += 1
+
+        if not (cov_trig or graph_trig):
+            stopped_unimodal += 1
+            final_clusters.append(idx)
+            continue
+
+        left = idx[left_local]
+        right = idx[right_local]
+
+        if discard_small:
+            left_bp = int(np.sum(lens[left]))
+            right_bp = int(np.sum(lens[right]))
+            if left_bp < MIN_BIN_BP and right_bp < MIN_BIN_BP:
+                final_clusters.append(idx)
+                continue
+
+        splits_accepted += 1
+        stack.append((left, depth + 1))
+        stack.append((right, depth + 1))
+
+    # Keep only clusters that meet the minimum bin bp.
+    kept: list[tuple[int, np.ndarray]] = []
+    for idx in final_clusters:
+        bp = int(np.sum(lens[idx]))
+        if bp >= MIN_BIN_BP or not discard_small:
+            kept.append((bp, idx))
+
+    kept.sort(key=lambda x: (-x[0], int(np.min(x[1]))))
+    for bin_id, (_bp, idx) in enumerate(kept):
+        for i in idx.tolist():
+            labels[int(i)] = int(bin_id)
+
+    contigs_assigned = sum(1 for x in labels if x is not None)
+    logger.info(
+        "Spectral bisection (auto-BIC): bins=%s assigned_contigs=%s/%s splits_attempted=%s splits_accepted=%s",
+        len(kept),
+        contigs_assigned,
+        n,
+        splits_attempted,
+        splits_accepted,
+    )
+
+    return labels, {
+        "k_selected": int(len(kept)),
+        "bins_written": int(len(kept)),
+        "contigs_assigned": int(contigs_assigned),
+        "contigs_unbinned": int(n - contigs_assigned),
+        "splits": {
+            "attempted": int(splits_attempted),
+            "accepted": int(splits_accepted),
+            "component_splits": int(component_splits),
+            "graph_bic_triggered": int(graph_bic_triggered),
+            "coverage_bic_triggered": int(coverage_bic_triggered),
+            "stopped_unimodal": int(stopped_unimodal),
+            "stopped_small": int(stopped_small),
+            "max_depth": int(max_depth),
+        },
+        "graph_bic": {"type": "bic_1v2_bernoulli_edge_presence"},
+        "coverage_bic": {"min_n": 20, "type": "bic_1gauss_vs_2gmm_on_log1p_cov"},
+        "graph_bic_top": graph_bic_top,
+    }
+
+
 def _divisive_bisect_by_coverage_bic(
     *,
     A,
@@ -693,6 +948,7 @@ def _divisive_bisect_by_coverage_bic(
 
 def _spectral_sweep_bisect(A_sub, *, seed: int) -> tuple["np.ndarray", "np.ndarray", dict]:
     import numpy as np
+    import scipy.sparse as sp
     import scipy.sparse.linalg as spla
 
     n = int(A_sub.shape[0])
@@ -704,17 +960,30 @@ def _spectral_sweep_bisect(A_sub, *, seed: int) -> tuple["np.ndarray", "np.ndarr
     nz = deg > 0
     d_inv_sqrt[nz] = 1.0 / np.sqrt(deg[nz])
 
-    def matvec(x):
-        y = d_inv_sqrt * x
-        y = A_sub @ y
-        y = d_inv_sqrt * y
-        return x - y
+    # For tiny clusters, build the dense Laplacian directly. ARPACK's eigsh does not
+    # support k>=N on LinearOperator inputs.
+    if n <= 3:
+        A_dense = A_sub.toarray() if sp.issparse(A_sub) else np.asarray(A_sub, dtype=float)
+        B = (d_inv_sqrt[:, None] * A_dense) * d_inv_sqrt[None, :]
+        L_dense = np.eye(n, dtype=float) - B
+        evals, evecs = np.linalg.eigh(L_dense)
+        order = np.argsort(evals)
+        evals = evals[order]
+        evecs = evecs[:, order]
+    else:
+        def matvec(x):
+            y = d_inv_sqrt * x
+            y = A_sub @ y
+            y = d_inv_sqrt * y
+            return x - y
 
-    L = spla.LinearOperator((n, n), matvec=matvec, dtype=float)
-    evals, evecs = spla.eigsh(L, k=2, which="SA")
-    order = np.argsort(evals)
-    evals = evals[order]
-    evecs = evecs[:, order]
+        L = spla.LinearOperator((n, n), matvec=matvec, dtype=float)
+        rng = np.random.default_rng(int(seed))
+        v0 = rng.standard_normal(n)
+        evals, evecs = spla.eigsh(L, k=2, which="SA", v0=v0)
+        order = np.argsort(evals)
+        evals = evals[order]
+        evecs = evecs[:, order]
 
     f = evecs[:, 1]
     node_order = np.argsort(f)

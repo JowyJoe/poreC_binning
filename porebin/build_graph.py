@@ -116,23 +116,71 @@ def build_graph(
             raise GraphBuildError(f"contacts.parquet missing required column 'contigs'. Found: {schema.names}")
         has_k = "k" in cols
         has_weight = "weight" in cols
-        read_cols = ["contigs"] + (["k"] if has_k else []) + (["weight"] if has_weight else [])
+        has_contig_weights = "contig_weights" in cols
+        read_cols = (
+            ["contigs"]
+            + (["contig_weights"] if has_contig_weights else [])
+            + (["k"] if has_k else [])
+            + (["weight"] if has_weight else [])
+        )
 
         for batch in parquet.iter_batches(batch_size=parquet_batch_size, columns=read_cols):
             data = batch.to_pydict()
             contigs_list = data["contigs"]
+            contig_weights_list = data.get("contig_weights")
             k_list = data.get("k")
             w_list = data.get("weight")
             n = len(contigs_list)
             for i in range(n):
                 stats.contacts_total += 1
-                contigs = contigs_list[i] or []
-                if not isinstance(contigs, list):
+                contigs_raw = contigs_list[i] or []
+                if not isinstance(contigs_raw, list):
                     raise GraphBuildError(
                         f"Invalid contigs type in contacts.parquet (expected list) at row {stats.contacts_total}"
                     )
-                contigs = [str(c) for c in contigs if str(c)]
-                contigs = _dedupe(contigs)
+                contigs = [str(c) for c in contigs_raw if str(c)]
+
+                p_weights: Optional[list[float]] = None
+                if contig_weights_list is not None:
+                    w_raw = contig_weights_list[i] or []
+                    if not isinstance(w_raw, list):
+                        raise GraphBuildError(
+                            f"Invalid contig_weights type in contacts.parquet (expected list) at row {stats.contacts_total}"
+                        )
+                    if len(w_raw) != len(contigs_raw):
+                        raise GraphBuildError(
+                            f"Mismatched contigs/contig_weights lengths at row {stats.contacts_total}: "
+                            f"len(contigs)={len(contigs_raw)} len(contig_weights)={len(w_raw)}"
+                        )
+                    # Filter empty contigs and align weights.
+                    pairs = [(str(c), float(w)) for c, w in zip(contigs_raw, w_raw, strict=True) if str(c)]
+                    if pairs:
+                        # Merge duplicates by summing weights (preserve first-seen order).
+                        seen: dict[str, int] = {}
+                        uniq_contigs: list[str] = []
+                        uniq_w: list[float] = []
+                        for c, w in pairs:
+                            if w < 0.0:
+                                raise GraphBuildError(
+                                    f"Negative contig_weight at row {stats.contacts_total}: contig={c!r} w={w}"
+                                )
+                            if c in seen:
+                                uniq_w[seen[c]] += float(w)
+                            else:
+                                seen[c] = len(uniq_contigs)
+                                uniq_contigs.append(c)
+                                uniq_w.append(float(w))
+                        contigs = uniq_contigs
+                        s = float(sum(uniq_w))
+                        if s <= 0.0:
+                            contigs = []
+                            p_weights = []
+                        else:
+                            p_weights = [float(x) / s for x in uniq_w]
+
+                if p_weights is None:
+                    contigs = _dedupe(contigs)
+
                 k = int(k_list[i]) if k_list is not None and k_list[i] is not None else len(contigs)
                 weight = float(w_list[i]) if w_list is not None and w_list[i] is not None else 1.0
 
@@ -144,19 +192,22 @@ def build_graph(
                     onorm = order_norm(k, method=order_norm_method)
                 except ValueError as exc:
                     raise GraphBuildError(f"Invalid k={k} in contacts.parquet: {exc}") from exc
-                edge_weight = onorm * weight
+                edge_weight_base = onorm * weight
 
                 meta_fh.write(f"{contact_idx}\t{k}\t{weight:.10g}\n")
                 stats.k_counter[k] += 1
                 stats.add_weight(weight)
                 stats.contacts_kept += 1
 
-                for contig in contigs:
+                for j, contig in enumerate(contigs):
                     idx = contig_to_idx.get(contig)
                     if idx is None:
                         raise GraphBuildError(
                             f"Contig '{contig}' in contacts.parquet not found in FASTA '{contigs_fasta}'."
                         )
+                    edge_weight = edge_weight_base
+                    if p_weights is not None:
+                        edge_weight *= float(p_weights[j])
                     edges_fh.write(f"{idx}\t{contact_idx}\t{edge_weight:.10g}\n")
                     stats.edges_written += 1
 
@@ -176,7 +227,10 @@ def build_graph(
         "input_contacts_parquet": str(contacts_parquet),
         "order_norm_method": order_norm_method,
         "order_norm_formula": _order_norm_formula(order_norm_method),
-        "edge_weight_formula": "edge_weight = OrderNorm(k) * contact_weight",
+        "edge_weight_formula": (
+            "edge_weight = OrderNorm(k) * contact_weight"
+            + (" * contig_weight (if contig_weights present)" if "contig_weights" in cols else "")
+        ),
         "num_contigs": len(contig_names),
         "num_contacts": stats.contacts_kept,
         "num_edges": stats.edges_written,
