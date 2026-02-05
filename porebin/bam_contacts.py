@@ -204,7 +204,11 @@ def bam_to_contacts_parquet(
         )
 
     current_qname: Optional[str] = None
-    prev_qname: Optional[str] = None
+    # NOTE: We only require QNAME *grouping* (all records of a read are contiguous),
+    # not a lexicographic monotone order. samtools may advertise "queryname:natural"
+    # ordering, which is not compatible with Python's string comparison.
+    enforce_lex_monotone = header_sort is None or str(header_sort).lower() not in {"queryname", "unknown"}
+    prev_qname: Optional[str] = None if enforce_lex_monotone else None
 
     # Per-read accumulators
     E_rc: dict[str, float] = {}
@@ -325,13 +329,19 @@ def bam_to_contacts_parquet(
         if not qname:
             continue
 
-        # Queryname sortedness check: required for streaming correctness.
-        if prev_qname is not None and qname < prev_qname:
-            raise BamContactsError(
-                "BAM must be queryname-sorted (samtools sort -n) so we can stream-group alignments by QNAME.\n"
-                f"Detected non-monotonic QNAME: {qname!r} < {prev_qname!r}."
-            )
-        prev_qname = qname
+        # Sortedness sanity check:
+        # - If header says SO:queryname (possibly SS:queryname:natural), we trust it and do NOT
+        #   enforce Python-lexicographic monotonicity.
+        # - If header is missing/odd, fall back to a strict monotone check to catch obvious mis-sorts.
+        if enforce_lex_monotone:
+            if prev_qname is not None and qname < prev_qname:
+                raise BamContactsError(
+                    "BAM must be queryname-grouped (samtools sort -n) so we can stream-group alignments by QNAME.\n"
+                    f"Detected non-monotonic QNAME (lex order): {qname!r} < {prev_qname!r}.\n"
+                    "If your BAM header reports SO:queryname with SS:queryname:natural, update porebin to a version "
+                    "that supports natural queryname ordering, or re-sort with samtools sort -n."
+                )
+            prev_qname = qname
 
         if current_qname is None:
             current_qname = qname
