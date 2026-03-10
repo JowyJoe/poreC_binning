@@ -13,7 +13,6 @@ from typing import Any, Iterable, Optional
 from porebin import __version__
 from porebin.build_graph import order_norm
 from porebin.export import MIN_BIN_BP
-from porebin.pairwise_baseline import parse_contacts_stream
 from porebin.utils import (
     dedupe_preserve_order,
     ensure_dir,
@@ -48,6 +47,21 @@ class RefineStats:
     recruit_assigned: int = 0
     split_triggered: int = 0
     split_applied: int = 0
+
+
+def _entropy(probs: list[float]) -> float:
+    """Natural entropy (nats)."""
+    h = 0.0
+    for p in probs:
+        p = float(p)
+        if p > 0.0:
+            h -= p * math.log(p)
+    return float(h)
+
+
+def _effective_hosts(entropy_nats: float) -> float:
+    """Effective support count: exp(entropy)."""
+    return float(math.exp(float(entropy_nats)))
 
 
 def refine_bins(
@@ -292,13 +306,26 @@ def refine_bins_parquet(
     logger: Optional[logging.Logger] = None,
 ) -> Path:
     """
-    Refine coarse bins using BAM-derived hyperedges (contacts.parquet with contig_weights).
+    Refine *candidate host communities* (coarse bins) into final host-centric assignments.
 
-    This follows docs/BAM_HYPERGRAPH_SPECTRAL_PIPELINE.md:
-      - Contacts are hyperedges (one row per read).
-      - Each hyperedge provides soft membership P_{r,c} = contig_weights.
-      - Read-level reliability factor R(r) is stored in contact weight.
-      - Downstream support uses w(r) = OrderNorm(k) * R(r).
+    Evidence-layer semantics (must hold):
+      - Each Pore-C read r is a hyperedge (one row per contact in contacts.parquet).
+      - contacts.parquet.contig_weights are pi_{r,c}: normalized evidence shares from read r to contig c.
+        They are NOT posterior probabilities.
+      - contacts.parquet.weight is q(r): read-level alignment quality weight in [0,1].
+
+    Refine-layer semantics (this function):
+      - Coarse bins are candidate host communities only (not final truth).
+      - Refine computes posterior-like host support scores theta_{c,b} for each contig c over candidate hosts b,
+        primarily from contact evidence, with a weak coarse-label prior/regularizer (indicator on coarse_host).
+      - Refine emits uncertainty summaries and a separate accessory/MGE-like association head (structural only).
+
+    High-order read treatment:
+      - Total read information is governed mainly by q(r).
+      - No strong pairwise-style normalization (e.g. 2/[k(k-1)]) is used in this refine inference pass.
+
+    Note:
+      - coverage_tsv is currently accepted for API compatibility; this MVP refine path does not directly use it.
     """
     logger = logger or logging.getLogger("porebin")
     out_dir = out_dir.resolve()
@@ -314,7 +341,7 @@ def refine_bins_parquet(
     run_json = out_dir / "run_refine.json"
     record: dict[str, Any] = {
         "porebin_version": __version__,
-        "command": "refine_parquet",
+        "command": "refine",
         "started_at": utc_now_iso(),
         "ended_at": None,
         "status": "running",
@@ -336,176 +363,336 @@ def refine_bins_parquet(
 
     stats = RefineStats()
     try:
+        # Numerical stability constant used in prior, normalization, and entropy.
+        eps = 1e-12
+
         contig_len = _read_contig_lengths(contigs_fasta)
         if not contig_len:
             raise RefineError(f"No contigs found in FASTA: {contigs_fasta}")
         stats.contigs_total = len(contig_len)
 
-        min_contig_len, min_contig_len_meta = auto_min_contig_len(contig_len)
-
-        coarse = _read_bins_tsv(bins_tsv)
-        stats.bins_total = len(set(coarse.values()))
-
-        # keep_bins is defined the same way as export: total_bp >= 200kb
-        coarse_bin_bp, _coarse_bin_n = _bin_sizes(coarse, contig_len, min_contig_len=min_contig_len)
-        keep_bins = {b for b, bp in coarse_bin_bp.items() if bp >= MIN_BIN_BP}
-        stats.bins_kept_initial = len(keep_bins)
-
-        contig_to_bin: dict[str, str] = {}
-        bin_to_contigs: dict[str, list[str]] = defaultdict(list)
-        unbinned_reason: dict[str, str] = {}
-        for contig, L in contig_len.items():
-            if L < min_contig_len:
-                stats.contigs_short += 1
-                unbinned_reason[contig] = "short_contig"
+        coarse_raw = _read_bins_tsv(bins_tsv)
+        coarse_filtered: dict[str, str] = {}
+        for c, b in coarse_raw.items():
+            c = str(c).strip()
+            b = str(b).strip()
+            if not c:
                 continue
-            b = coarse.get(contig)
-            if b is None:
-                unbinned_reason[contig] = "unassigned"
+            if c not in contig_len:
                 continue
-            if b not in keep_bins:
-                unbinned_reason[contig] = "tiny_bin"
-                continue
-            contig_to_bin[contig] = b
-            bin_to_contigs[b].append(contig)
-        stats.contigs_assigned_initial = len(contig_to_bin)
+            coarse_filtered[c] = b
 
-        # coverage (optional)
-        cov: Optional[dict[str, float]] = None
-        bin_cov_stats: Optional[dict[str, dict[str, float]]] = None
-        coverage_source_meta: Optional[dict[str, Any]] = None
-        if coverage_tsv is None:
-            # Try common cached locations:
-            #   - <bins_dir>/coverage/coverage.tsv (cached by spectral coarse)
-            #   - <run_root>/coverage/coverage.tsv (cached by bam2contacts)
-            candidates = [
-                bins_tsv.parent / "coverage" / "coverage.tsv",
-                bins_tsv.parent.parent / "coverage" / "coverage.tsv",
-                contacts_parquet.parent.parent / "coverage" / "coverage.tsv",
-            ]
-            for cand in candidates:
-                try:
-                    if cand.exists():
-                        coverage_tsv = cand
-                        break
-                except Exception:
+        # Candidate host bins set B (exclude -1).
+        B: list[str] = sorted({b for b in coarse_filtered.values() if b and b != "-1"})
+        B_set = set(B)
+        if not B:
+            raise RefineError("No candidate host bins found in coarse bins.tsv (empty or only -1).")
+
+        stats.bins_total = int(len(B))
+        stats.bins_kept_initial = int(stats.bins_total)
+
+        # Coarse label per contig in the FASTA; use "-1" for unassigned/noise.
+        contig_to_coarse: dict[str, str] = {}
+        assigned = 0
+        for c in contig_len.keys():
+            b = coarse_filtered.get(c, "-1")
+            b = str(b).strip() if b is not None else "-1"
+            if b not in B_set:
+                b = "-1"
+            else:
+                assigned += 1
+            contig_to_coarse[c] = b
+        stats.contigs_assigned_initial = int(assigned)
+
+        # support[c][b] accumulates contact-driven host support mass for contig c towards candidate host bin b.
+        # This is an inference-layer quantity (not pi_{r,c}).
+        support: defaultdict[str, dict[str, float]] = defaultdict(dict)
+
+        reads_total = 0
+        reads_used = 0
+        reads_skipped_k_lt_2 = 0
+        for contigs_raw, pi_raw, q in _iter_contacts_parquet(contacts_parquet, batch_size=100_000):
+            reads_total += 1
+            if not contigs_raw or not pi_raw:
+                continue
+
+            # Merge duplicates and renormalize pi.
+            seen: dict[str, int] = {}
+            contigs: list[str] = []
+            pi: list[float] = []
+            for c, w in zip(contigs_raw, pi_raw, strict=True):
+                c = str(c).strip()
+                if not c:
                     continue
-        if coverage_tsv is not None and coverage_tsv.exists():
-            logger.info(f"Refine(parquet): using coverage TSV: {coverage_tsv}")
-            cov = _coverage_from_tsv(coverage_tsv, contig_len=contig_len, min_contig_len=min_contig_len)
-            coverage_source_meta = {"type": "coverage_tsv", "path": str(coverage_tsv)}
-            bin_cov_stats = _bin_coverage_stats(bin_to_contigs, cov)
+                if c not in contig_len:
+                    continue
+                ww = float(w)
+                if ww <= 0.0:
+                    continue
+                if c in seen:
+                    pi[seen[c]] += ww
+                else:
+                    seen[c] = len(contigs)
+                    contigs.append(c)
+                    pi.append(ww)
 
-        # Pass 1: contact support + affinity (soft hyperedges).
-        intra, other, affinity, contact_meta = _scan_contacts_support_and_affinity_parquet(
-            contacts_parquet=contacts_parquet,
-            contig_len=contig_len,
-            min_contig_len=min_contig_len,
-            contig_to_bin=contig_to_bin,
-        )
-        stats.reads_total = int(contact_meta["reads_total"])
-        stats.reads_kept = int(contact_meta["reads_kept"])
-        stats.reads_skipped_k_lt_2 = int(contact_meta["reads_skipped_k_lt_2"])
-        stats.input_sorted_by_readid = True  # parquet contacts are already per-read
+            if len(contigs) < 2:
+                reads_skipped_k_lt_2 += 1
+                continue
 
-        # Reassign / unbin based on LLR = log(intra) - log(best_other).
-        reassign_path = out_dir / "reassign.tsv"
-        reassign_meta = _reassign_or_unbin(
-            contacts_parquet=contacts_parquet,
-            contig_len=contig_len,
-            min_contig_len=min_contig_len,
-            contig_to_bin=contig_to_bin,
-            bin_to_contigs=bin_to_contigs,
-            intra_support=intra,
-            other_support=other,
-            cov=cov,
-            bin_cov_stats=bin_cov_stats,
-            out_path=reassign_path,
-            logger=logger,
-        )
-        stats.reassign_moved = int(reassign_meta.get("moved", 0) or 0)
-        stats.reassign_unbinned = int(reassign_meta.get("unbinned", 0) or 0)
+            s = float(sum(pi))
+            if not (s > 0.0):
+                continue
+            pi = [float(x) / s for x in pi]
 
-        # Drop bins below MIN_BIN_BP after reassign/unbin (align with export).
-        bin_bp2, _ = _bin_sizes_from_assignment(contig_to_bin, contig_len)
-        keep_bins2 = {b for b, bp in bin_bp2.items() if bp >= MIN_BIN_BP}
-        _drop_bins_below_min(bin_to_contigs, contig_to_bin, keep_bins2, unbinned_reason)
+            reads_used += 1
+            q_read = float(q)
 
-        # Pass 2: recompute affinity under updated assignments (for recruit).
-        _intra2, _other2, affinity2, _meta2 = _scan_contacts_support_and_affinity_parquet(
-            contacts_parquet=contacts_parquet,
-            contig_len=contig_len,
-            min_contig_len=min_contig_len,
-            contig_to_bin=contig_to_bin,
-        )
+            # Bin mass per candidate host: M_r(b) = sum_{u in bin b} pi_{r,u}
+            m_by_host: dict[str, float] = {}
+            host_of: list[str] = []
+            for c, pc in zip(contigs, pi, strict=True):
+                b = contig_to_coarse.get(c, "-1")
+                host_of.append(b)
+                if b == "-1":
+                    continue
+                m_by_host[b] = m_by_host.get(b, 0.0) + float(pc)
 
-        recruit_path = out_dir / "recruit_assign.tsv"
-        recruit_result = _recruit_gmm(
-            affinity=affinity2,
-            contig_len=contig_len,
-            min_contig_len=min_contig_len,
-            contig_to_bin=contig_to_bin,
-            bin_to_contigs=bin_to_contigs,
-            keep_bins=keep_bins2,
-            cov=cov,
-            bin_cov_stats=bin_cov_stats,
-            out_path=recruit_path,
-        )
-        recruited = recruit_result["assigned"]
-        stats.recruit_assigned = len(recruited)
-        for c in recruited:
-            unbinned_reason.pop(c, None)
+            if not m_by_host:
+                continue
 
-        # Optional split (coverage BIC trigger), adapted to parquet hyperedges.
-        split_map = out_dir / "split_map.tsv"
-        split_meta = _split_bins_parquet(
-            contacts_parquet=contacts_parquet,
-            contig_len=contig_len,
-            min_contig_len=min_contig_len,
-            contig_to_bin=contig_to_bin,
-            bin_to_contigs=bin_to_contigs,
-            cov=cov,
-            out_path=split_map,
-            seed=seed,
-        )
-        stats.split_triggered = int(split_meta["bins_triggered"])
-        stats.split_applied = int(split_meta["bins_split"])
-        for c in split_meta["contigs_unbinned"]:
-            unbinned_reason[c] = "removed_by_refine"
+            # MVP v1 support update (strict definition):
+            #   support[c][b] += q(r) * pi_{r,c} * max(0, M_r(b) - self_term)
+            # where:
+            #   M_r(b) = sum_{u in bin b} pi_{r,u}
+            #   self_term = pi_{r,c} if coarse_bin(c) == b else 0
+            # High-order read philosophy: eta(k)=1.0 (no extra k penalty in refine).
+            for c, pc, b_c in zip(contigs, pi, host_of, strict=True):
+                pc = float(pc)
+                if pc <= 0.0:
+                    continue
+                d = support.get(c)
+                if d is None:
+                    d = {}
+                    support[c] = d
+                for b, m in m_by_host.items():
+                    m_eff = float(m)
+                    if b_c == b:
+                        m_eff = max(0.0, m_eff - pc)
+                    if m_eff <= 0.0:
+                        continue
+                    d[b] = float(d.get(b, 0.0)) + q_read * pc * m_eff
 
-        # Final keep bins (align with export)
-        final_bp, _ = _bin_sizes_from_assignment(contig_to_bin, contig_len)
-        keep_bins_final = {b for b, bp in final_bp.items() if bp >= MIN_BIN_BP}
-        stats.bins_kept_final = len(keep_bins_final)
+        stats.reads_total = int(reads_total)
+        stats.reads_kept = int(reads_used)
+        stats.reads_skipped_k_lt_2 = int(reads_skipped_k_lt_2)
+        stats.input_sorted_by_readid = True
 
+        # Fixed MVP constants/thresholds (must be explicit and recorded).
+        prior_strength = 0.05
+
+        core_top1_score_thresh = 0.80
+        core_margin_thresh = 0.50
+        core_eff_hosts_thresh = 1.5
+
+        accessory_eff_hosts_thresh = 2.0
+        accessory_entropy_thresh = float(math.log(2.0))
+        accessory_top1_lt = 0.85
+
+        contig_scores_path = out_dir / "contig_host_scores.tsv"
+        assoc_path = out_dir / "accessory_associations.tsv"
         refined_bins = out_dir / "bins.refined.tsv"
-        with refined_bins.open("w", encoding="utf-8", newline="") as fh:
-            fh.write("contig_name\tbin_id\n")
-            for contig, b in contig_to_bin.items():
-                if b in keep_bins_final:
-                    fh.write(f"{contig}\t{b}\n")
-        stats.contigs_assigned_final = sum(1 for _c, b in contig_to_bin.items() if b in keep_bins_final)
+
+        B_count = int(len(B))
+        contigs_all = sorted(contig_len.keys())
+
+        n_core = 0
+        n_accessory = 0
+        n_ambiguous = 0
+        final_bins_used: set[str] = set()
+
+        with refined_bins.open("w", encoding="utf-8", newline="") as fh_bins, contig_scores_path.open(
+            "w", encoding="utf-8", newline=""
+        ) as fh_scores, assoc_path.open("w", encoding="utf-8", newline="") as fh_assoc:
+            fh_bins.write("contig_name\tbin_id\n")
+            fh_scores.write(
+                "contig_name\tcoarse_host\ttop1_host\ttop2_host\t"
+                "top1_score\ttop2_score\tmargin\tentropy\teffective_hosts\t"
+                "has_contact_support\tis_core_like\tis_ambiguous\tis_accessory_candidate\n"
+            )
+            fh_assoc.write(
+                "contig_name\ttop_hosts\thost_weights\thost_entropy\teffective_hosts\t"
+                "association_confidence\tsingle_host_like\tbroad_host_like\n"
+            )
+
+            for c in contigs_all:
+                coarse_host = contig_to_coarse.get(c, "-1")
+                sdict = support.get(c, {})
+
+                # MVP prior: weak coarse-label regularizer (indicator on coarse_host), not a direct feature prior.
+                sum_support = float(sum(float(v) for v in sdict.values()))
+                has_contact_support = bool(sum_support > 0.0)
+                alpha_c = float(prior_strength * (sum_support + eps))
+
+                # If a contig has no contact support and has no coarse prior (coarse_host == -1),
+                # treat it as unresolved-no-contact rather than accessory-like.
+                if (not has_contact_support) and (coarse_host == "-1"):
+                    top1_host = "-1"
+                    top2_host = "-1"
+                    top1_score = 0.0
+                    top2_score = 0.0
+                    margin = 0.0
+                    ent = 0.0
+                    effective_hosts = 0.0
+                    is_core_like = False
+                    is_accessory = False
+                    is_ambiguous = True
+                    fh_scores.write(
+                        f"{c}\t{coarse_host}\t{top1_host}\t{top2_host}\t"
+                        f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
+                        f"{1 if has_contact_support else 0}\t"
+                        f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
+                    )
+                    n_ambiguous += 1
+                    continue
+
+                score_nz: dict[str, float] = {b: float(v) for b, v in sdict.items() if b in B_set and float(v) > 0.0}
+                if coarse_host in B_set:
+                    score_nz[coarse_host] = float(score_nz.get(coarse_host, 0.0)) + alpha_c
+
+                n_nonzero_hosts = int(len(score_nz))
+                sum_score = float(sum_support + (alpha_c if coarse_host in B_set else 0.0))
+                denom = float(sum_score + (B_count * eps))
+                if denom <= 0.0:
+                    denom = float(B_count * eps)
+
+                def theta_of(b: str) -> float:
+                    # theta[c][b] = (score[c][b] + eps) / sum_{b'}(score[c][b'] + eps)
+                    return float((float(score_nz.get(b, 0.0)) + eps) / denom)
+
+                # Rank bins by score (desc, tie by bin_id asc), then fill with zero-score bins in B order.
+                ranked: list[str] = [bb for bb, _v in sorted(score_nz.items(), key=lambda kv: (-kv[1], kv[0]))]
+                if len(ranked) < 3:
+                    for bb in B:
+                        if bb in score_nz:
+                            continue
+                        ranked.append(bb)
+                        if len(ranked) >= 3:
+                            break
+                if not ranked:
+                    ranked = B[:3]
+
+                top1_host = ranked[0]
+                top2_host = ranked[1] if B_count >= 2 else ""
+
+                top1_score = theta_of(top1_host)
+                top2_score = theta_of(top2_host) if top2_host else 0.0
+                margin = float(top1_score - top2_score)
+
+                # entropy = -sum_b theta[c][b] * log(theta[c][b] + eps)
+                theta0 = float(eps / denom)
+                ent = 0.0
+                for _bb, sc in score_nz.items():
+                    th = float((float(sc) + eps) / denom)
+                    ent -= th * math.log(th + eps)
+                n0 = int(B_count - len(score_nz))
+                if n0 > 0:
+                    ent -= float(n0) * theta0 * math.log(theta0 + eps)
+                effective_hosts = float(math.exp(ent))
+
+                is_core_like = bool(
+                    (top1_score >= core_top1_score_thresh)
+                    and (margin >= core_margin_thresh)
+                    and (effective_hosts <= core_eff_hosts_thresh)
+                )
+                is_accessory = bool(
+                    (effective_hosts >= accessory_eff_hosts_thresh)
+                    or ((ent >= accessory_entropy_thresh) and (top1_score < accessory_top1_lt))
+                )
+                is_ambiguous = bool(not is_core_like)
+
+                if is_core_like:
+                    n_core += 1
+                    final_bins_used.add(top1_host)
+                    fh_bins.write(f"{c}\t{top1_host}\n")
+                if is_accessory:
+                    n_accessory += 1
+                if is_ambiguous:
+                    n_ambiguous += 1
+
+                fh_scores.write(
+                    f"{c}\t{coarse_host}\t{top1_host}\t{top2_host}\t"
+                    f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
+                    f"{1 if has_contact_support else 0}\t"
+                    f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
+                )
+
+                if is_accessory:
+                    # Accessory association head: report only hosts with nonzero scores (no zero-padding).
+                    if not score_nz:
+                        continue
+                    ranked_nz = [bb for bb, _v in sorted(score_nz.items(), key=lambda kv: (-kv[1], kv[0]))]
+                    topK = min(3, len(ranked_nz))
+                    top_hosts = ranked_nz[:topK]
+                    theta_top = [theta_of(bb) for bb in top_hosts]
+                    z = float(sum(theta_top))
+                    if z <= 0.0:
+                        host_weights = [1.0 / float(topK)] * int(topK)
+                    else:
+                        host_weights = [float(x) / z for x in theta_top]
+
+                    # association_confidence = 1 - entropy / log(max(2, number_of_nonzero_hosts)), clip to [0,1]
+                    denom_k = float(math.log(max(2, n_nonzero_hosts)))
+                    conf = float(1.0 - (ent / denom_k)) if denom_k > 0.0 else 0.0
+                    conf = float(max(0.0, min(1.0, conf)))
+
+                    single_host_like = bool((top1_score >= 0.80) and (effective_hosts < 1.5))
+                    broad_host_like = bool(effective_hosts >= 2.0)
+
+                    fh_assoc.write(
+                        f"{c}\t{','.join(top_hosts)}\t{','.join(f'{w:.6g}' for w in host_weights)}\t"
+                        f"{ent:.6g}\t{effective_hosts:.6g}\t{conf:.6g}\t"
+                        f"{1 if single_host_like else 0}\t{1 if broad_host_like else 0}\n"
+                    )
+
+        stats.contigs_assigned_final = int(n_core)
+        stats.bins_kept_final = int(len(final_bins_used))
 
         record["thresholds"] = {
-            "MIN_BIN_BP": MIN_BIN_BP,
-            "MIN_CONTIG_LEN": min_contig_len,
-            "MIN_CONTIG_LEN_method": min_contig_len_meta,
+            "eps": eps,
+            "core_like_thresholds": {
+                "top1_score_min": core_top1_score_thresh,
+                "margin_min": core_margin_thresh,
+                "effective_hosts_max": core_eff_hosts_thresh,
+            },
+            "accessory_thresholds": {
+                "effective_hosts_min": accessory_eff_hosts_thresh,
+                "entropy_min": accessory_entropy_thresh,
+                "top1_score_lt_if_entropy_trigger": accessory_top1_lt,
+            },
+            "ambiguous_rule": "not core-like (accessory may also be ambiguous)",
         }
         record["decisions"] = {
-            "contacts_source": "bam_parquet_soft_hyperedges",
-            "order_norm": "2/(k*(k-1))  # == 1/C(k,2)",
-            "coverage_source": coverage_source_meta,
-            "keep_bins_rule": "total_bp >= 200kb",
-            "reassign": reassign_meta,
-            "recruit": recruit_result,
-            "split": {**split_meta["meta"], "bins_triggered": split_meta.get("bins_triggered_list", [])},
+            "coarse_bins_semantics": "candidate_host_communities",
+            "contig_weights_semantics": "normalized_evidence_share",
+            "refine_method": "host_assignment_inference",
+            "high_order_read_philosophy": "q_controls_total_information",
+            "eta_k": 1.0,
+            "coarse_prior_used": True,
+            "coarse_prior_strength": prior_strength,
+            "direct_feature_prior_used": False,
         }
-        record["stats"] = stats.__dict__
+        record["stats"] = {
+            **stats.__dict__,
+            "candidate_bins_count": int(B_count),
+            "contigs_core_like": int(n_core),
+            "contigs_ambiguous": int(n_ambiguous),
+            "contigs_accessory_candidates": int(n_accessory),
+        }
         record["outputs"] = {
             "bins_refined_tsv": str(refined_bins),
-            "reassign_tsv": str(reassign_path),
-            "recruit_assign_tsv": str(recruit_path),
-            "split_map_tsv": str(split_map),
+            "contig_host_scores_tsv": str(contig_scores_path),
+            "accessory_associations_tsv": str(assoc_path),
         }
         record["status"] = "ok"
         return refined_bins
@@ -795,8 +982,8 @@ def _iter_contacts_parquet(
 
     Expected columns:
       - contigs: list[str]
-      - contig_weights: list[float]  (P_{r,c}, should sum to 1 after filtering/renormalization)
-      - weight: float (R(r), read reliability factor; default 1.0 if missing)
+      - contig_weights: list[float]  (pi_{r,c} normalized evidence shares; should sum to 1 per read)
+      - weight: float (q(r), read quality weight; default 1.0 if missing)
     """
     try:
         import pyarrow.parquet as pq
@@ -846,7 +1033,7 @@ def _scan_contacts_support_and_affinity_parquet(
 
     This implements the soft-hyperedge support in docs/BAM_HYPERGRAPH_SPECTRAL_PIPELINE.md:
       - P_{r,c} is contig_weights (renormalized after filtering)
-      - w(r) = OrderNorm(k) * R(r) where R(r) is contact weight
+      - w(r) = OrderNorm(k) * q(r) where q(r) is contact weight
       - Support towards a bin uses S(v,b)=sum_r w(r) P_{r,v} * (sum_{u in b} P_{r,u})
     """
     intra: defaultdict[str, float] = defaultdict(float)
@@ -1805,7 +1992,7 @@ class _InducedBuilder:
 
         This is used by the BAM/parquet refine split step, where we build an induced bipartite
         graph inside one coarse bin using weighted incidences:
-          edge_weight(c,r) = OrderNorm(k(r)) * R(r) * P_{r,c}
+          edge_weight(c,r) = OrderNorm(k(r)) * q(r) * P_{r,c}
         (see docs/BAM_HYPERGRAPH_SPECTRAL_PIPELINE.md).
         """
         contact_node = self.n_contigs + self.n_contacts

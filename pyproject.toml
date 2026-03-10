@@ -26,6 +26,8 @@ bam = [
 ]
 spectral = [
   "scipy>=1.10",
+  "scikit-learn>=1.2",
+  "hdbscan>=0.8",
 ]
 
 [project.scripts]

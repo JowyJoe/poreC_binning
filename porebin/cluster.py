@@ -17,227 +17,155 @@ class GraphClusterError(RuntimeError):
     pass
 
 
-def cluster_leiden(
-    *,
-    graph_dir: Path,
-    out_bins_tsv: Path,
-    resolution: float = 1.0,
-    seed: int = 0,
-    logger: Optional[logging.Logger] = None,
-) -> None:
-    logger = logger or logging.getLogger("porebin")
-    graph_dir = graph_dir.resolve()
-    out_bins_tsv = out_bins_tsv.resolve()
-
-    contig_names = _read_contig_index(graph_dir / "contig_index.tsv")
-    if not contig_names:
-        raise GraphClusterError(f"No contigs found in {graph_dir / 'contig_index.tsv'}")
-
-    meta = _read_graph_meta(graph_dir / "graph_meta.json")
-    num_contigs = len(contig_names)
-    num_contacts = int(meta.get("num_contacts", 0))
-    if num_contacts <= 0:
-        raise GraphClusterError(f"Invalid num_contacts in {graph_dir / 'graph_meta.json'}: {num_contacts}")
-
-    edges, weights = _read_edges(graph_dir / "edges.tsv", contig_offset=num_contigs)
-    if not edges:
-        raise GraphClusterError(f"No edges found in {graph_dir / 'edges.tsv'}")
-
-    logger.info(
-        f"Clustering bipartite graph: contigs={num_contigs}, contacts={num_contacts}, edges={len(edges)}"
-    )
-
-    try:
-        import igraph as ig
-        import leidenalg
-    except Exception as exc:  # pragma: no cover
-        raise GraphClusterError(
-            "cluster requires 'python-igraph' and 'leidenalg'. Install them, e.g. pip install python-igraph leidenalg."
-        ) from exc
-
-    g = ig.Graph(n=num_contigs + num_contacts, edges=edges, directed=False)
-    g.es["weight"] = weights
-    g.vs["type"] = [False] * num_contigs + [True] * num_contacts
-
-    partition = leidenalg.find_partition(
-        g,
-        leidenalg.RBConfigurationVertexPartition,
-        weights="weight",
-        resolution_parameter=resolution,
-        seed=seed,
-    )
-
-    membership = partition.membership[:num_contigs]
-    out_bins_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with out_bins_tsv.open("w", encoding="utf-8", newline="") as fh:
-        fh.write("contig_name\tbin_id\n")
-        for name, bin_id in zip(contig_names, membership, strict=True):
-            fh.write(f"{name}\t{bin_id}\n")
-
-    logger.info(f"Wrote bins: {out_bins_tsv}")
-
-
 def cluster_spectral_hypergraph(
     *,
     graph_dir: Path,
     out_bins_tsv: Path,
     seed: int = 0,
     bam: Optional[Path] = None,
+    threads: int = 1,
     logger: Optional[logging.Logger] = None,
 ) -> dict:
     """
-    Hypergraph spectral clustering via a Zhou-style normalized hypergraph Laplacian.
+    Joint hypergraph spectral embedding + HDBSCAN (v2).
 
-    We treat the contig-contact bipartite incidence as a hypergraph incidence matrix H,
-    where hyperedge weights are already encoded by `edges.tsv` weights (typically OrderNorm(k)*weight*P_{r,c}).
-    We compute the contig-contig similarity:
-      A = H * D_e^{-1} * H^T
+    This replaces the legacy "recursive bisection + BIC stop rule" spectral coarse clustering.
+    It does NOT construct a dense |V|x|V| matrix and does NOT do clique expansion.
 
-    Clustering is done by top-down spectral bisection on A:
-      - Always: split if a 2-block graph model fits better than 1-block (BIC on edge presence).
-      - If `bam` (or cached coverage TSV) is available: additionally split if coverage is multi-modal
-        (BIC: 1-Gaussian vs 2-GMM on log1p coverage).
-      - Disconnected components are split parameter-free.
-      - Clusters below the 200kb minimum bin size are treated as unbinned (aligns with export/refine).
+    Hypergraphs:
+      1) Contact hypergraph from contacts.parquet (soft incidence P_{e,c})
+      2) Feature hypergraph from tetranucleotide composition (+ optional coverage) via kNN
 
-    This is an experimental coarse clustering alternative to Leiden.
+    Joint operator:
+      Theta_joint = lambda_contact * Theta_contact + (1-lambda_contact) * Theta_feature
+
+    Embedding:
+      top (d+1) eigenvectors of Theta_joint (which="LA"), drop the first, L2-normalize rows.
+
+    Clustering:
+      HDBSCAN on the embedding (min_cluster_size=5), labels==-1 => unbinned.
     """
     logger = logger or logging.getLogger("porebin")
     graph_dir = graph_dir.resolve()
     out_bins_tsv = out_bins_tsv.resolve()
     bam = bam.resolve() if bam is not None else None
-
-    contig_names = _read_contig_index(graph_dir / "contig_index.tsv")
-    if not contig_names:
-        raise GraphClusterError(f"No contigs found in {graph_dir / 'contig_index.tsv'}")
+    threads = max(1, int(threads))
 
     meta = _read_graph_meta(graph_dir / "graph_meta.json")
-    num_contigs = len(contig_names)
-    num_contacts = int(meta.get("num_contacts", 0))
-    if num_contacts <= 0:
-        raise GraphClusterError(f"Invalid num_contacts in {graph_dir / 'graph_meta.json'}: {num_contacts}")
-
-    rows, cols, data = _read_incidence(graph_dir / "edges.tsv")
-    if not rows:
-        raise GraphClusterError(f"No edges found in {graph_dir / 'edges.tsv'}")
-
     try:
         import numpy as np
-        import scipy.sparse as sp
+        import scipy
     except Exception as exc:  # pragma: no cover
         raise GraphClusterError(
-            "spectral clustering requires optional dependency: scipy. "
-            "Install it (e.g. pip install 'porebin[spectral]' or conda install scipy)."
+            "spectral clustering requires optional dependencies: scipy + scikit-learn + hdbscan. "
+            "Install them (e.g. pip install 'porebin[spectral]' or conda install scipy)."
         ) from exc
 
-    logger.info(
-        "Spectral clustering hypergraph incidence: contigs=%s, contacts=%s, incidences=%s",
-        num_contigs,
-        num_contacts,
-        len(rows),
+    from porebin.hypergraph_joint_spectral import (
+        JointSpectralError,
+        build_contact_incidence_from_parquet,
+        build_feature_incidence,
+        build_feature_knn_edges,
+        hdbscan_cluster,
+        load_contig_index,
+        load_coverage_feature_optional,
+        load_or_build_tnf136_features,
+        make_theta_operator,
+        postprocess_labels_by_contact_components,
+        spectral_embed_joint,
+        write_bins_tsv,
+        zscore_features,
     )
 
-    H = sp.coo_matrix((np.asarray(data, dtype=float), (np.asarray(rows), np.asarray(cols))), shape=(num_contigs, num_contacts)).tocsr()
+    contig_name_to_idx, idx_to_name = load_contig_index(graph_dir)
+    V = len(idx_to_name)
+    if V < 2:
+        raise GraphClusterError("Too few contigs for spectral clustering.")
 
-    dv = np.asarray(H.sum(axis=1)).ravel()
-    if not np.any(dv > 0):
-        raise GraphClusterError("All contigs have zero incidence degree; cannot run spectral clustering.")
-    de = np.asarray(H.sum(axis=0)).ravel()
-    if not np.any(de > 0):
-        raise GraphClusterError("All contacts have zero incidence degree; cannot run spectral clustering.")
-
-    # A = H * D_e^{-1} * H^T
-    de_inv = np.zeros_like(de, dtype=float)
-    nz = de > 0
-    de_inv[nz] = 1.0 / de[nz]
-    A = H.multiply(de_inv) @ H.T
-    A.setdiag(0.0)
-    A.eliminate_zeros()
-
-    # contig lengths are used for (a) filtering very short contigs and (b) bin-size gating.
     contigs_fasta_s = meta.get("input_contigs_fasta")
-    contigs_fasta = Path(contigs_fasta_s).expanduser().resolve() if contigs_fasta_s else None
-    if contigs_fasta is None or not contigs_fasta.exists():
+    contacts_parquet_s = meta.get("input_contacts_parquet")
+    if not contigs_fasta_s or not contacts_parquet_s:
         raise GraphClusterError(
-            "Spectral clustering requires the original contigs FASTA path in graph_meta.json (input_contigs_fasta). "
-            f"Got: {contigs_fasta_s!r}"
+            "spectral_v2 requires graph_meta.json to contain input_contigs_fasta and input_contacts_parquet."
+        )
+    contigs_fasta = Path(contigs_fasta_s).expanduser().resolve()
+    contacts_parquet = Path(contacts_parquet_s).expanduser().resolve()
+
+    # Optional coverage.tsv is used only as a feature; no BAM scan in v2.
+    cov_path = graph_dir.parent / "coverage" / "coverage.tsv"
+    cov_path = cov_path if cov_path.exists() else None
+    lambda_contact = 0.6 if cov_path is not None else 0.7
+    knn_k = 15
+
+    try:
+        contact = build_contact_incidence_from_parquet(contacts_parquet, contig_name_to_idx, logger=logger)
+        X_comp = load_or_build_tnf136_features(
+            graph_dir=graph_dir, contigs_fasta=contigs_fasta, contig_name_to_idx=contig_name_to_idx, logger=logger
+        )
+        x_cov, coverage_missing_count, coverage_used = load_coverage_feature_optional(cov_path, contig_name_to_idx)
+        X = np.concatenate([X_comp.astype(np.float32, copy=False), x_cov.reshape(-1, 1)], axis=1)
+        X = zscore_features(X)
+
+        neighbors = build_feature_knn_edges(X, knn_k)
+        feature = build_feature_incidence(neighbors, knn_k)
+
+        contact_theta = make_theta_operator(contact.H_csr, contact.W, contact.De, contact.Dv)
+        feature_theta = make_theta_operator(feature.H_csr, feature.W, feature.De, feature.Dv)
+
+        d = min(128, max(32, int(math.floor(math.log2(float(V)))) * 4))
+        d = min(d, max(1, V - 2))
+
+        Z = spectral_embed_joint(
+            contact_op=contact_theta.op,
+            feature_op=feature_theta.op,
+            lambda_contact=lambda_contact,
+            d=int(d),
+            seed=seed,
         )
 
-    contig_len = _read_contig_lengths(contigs_fasta)
-    if not contig_len:
-        raise GraphClusterError(f"No contigs found in FASTA: {contigs_fasta}")
-
-    lengths = np.asarray([contig_len.get(n, 0) for n in contig_names], dtype=int)
-    min_contig_len, min_contig_len_meta = _auto_min_contig_len(lengths)
-    keep_mask = (lengths >= int(min_contig_len)) & (dv > 0)
-    keep_idx = np.where(keep_mask)[0]
-    if keep_idx.size < 2:
-        raise GraphClusterError(
-            f"Too few contigs with contacts and length >= MIN_CONTIG_LEN={min_contig_len} for spectral clustering (n={keep_idx.size})."
+        labels, hmeta = hdbscan_cluster(Z, min_cluster_size=5, threads=threads)
+        # Contact-isolated contigs are treated as unbinned.
+        labels = np.asarray(labels, dtype=int)
+        labels[np.asarray(contact.isolated_mask_contact, dtype=bool)] = -1
+        labels, pp = postprocess_labels_by_contact_components(
+            labels, contact.H_csr, min_cluster_size=5
         )
 
-    # Optional coverage (BAM scan OR cached coverage TSV if present).
-    cov_arr = None
-    cov_out = out_bins_tsv.parent / "coverage" / "coverage.tsv"
-    cov: Optional[dict[str, float]] = None
-    coverage_source: Optional[dict] = None
-    if cov_out.exists():
-        cov = _coverage_from_tsv(cov_out, contig_len=contig_len, min_contig_len=min_contig_len)
-        coverage_source = {"type": "coverage_tsv", "path": str(cov_out)}
-    elif bam is not None:
-        if not bam.exists():
-            raise FileNotFoundError(f"BAM not found: {bam}")
-        cov = _coverage_from_bam(
-            bam, contig_names=contig_names, contig_len=contig_len, min_contig_len=min_contig_len, logger=logger
-        )
-        coverage_source = {"type": "bam_scan", "bam": str(bam)}
+        num_bins, unbinned = write_bins_tsv(out_bins_tsv, idx_to_name, labels)
+        logger.info("Wrote bins: %s", out_bins_tsv)
 
-        # Cache coverage for later refine (avoid scanning BAM twice).
-        cov_out.parent.mkdir(parents=True, exist_ok=True)
-        with cov_out.open("w", encoding="utf-8", newline="") as fh:
-            fh.write("contig_name\tcoverage\n")
-            for name in contig_names:
-                if contig_len.get(name, 0) >= min_contig_len:
-                    fh.write(f"{name}\t{cov.get(name, 0.0):.12g}\n")
+        sklearn_version = None
+        try:
+            import sklearn
 
-    if cov is not None:
-        cov_arr = np.asarray([cov.get(n, 0.0) for n in contig_names], dtype=float)
+            sklearn_version = getattr(sklearn, "__version__", None)
+        except Exception:
+            sklearn_version = None
 
-    labels_keep, meta_bisect = _divisive_bisect_by_auto_bic(
-        A=A[keep_idx][:, keep_idx].tocsr(),
-        lengths=lengths[keep_idx],
-        coverage=(cov_arr[keep_idx] if cov_arr is not None else None),
-        seed=seed,
-        logger=logger,
-        discard_small=True,
-    )
-
-    out_bins_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with out_bins_tsv.open("w", encoding="utf-8", newline="") as fh:
-        fh.write("contig_name\tbin_id\n")
-        for i, b in enumerate(labels_keep):
-            if b is None:
-                continue
-            fh.write(f"{contig_names[keep_idx[i]]}\t{b}\n")
-
-    logger.info(f"Wrote bins: {out_bins_tsv}")
-
-    stop_rule = "split if graph_BIC(2-block) < graph_BIC(1-block)"
-    if cov_arr is not None:
-        stop_rule += " OR coverage_BIC(2-GMM) < coverage_BIC(1-Gauss) on log1p(cov)"
-
-    return {
-        "method": "spectral_hypergraph_bisection_auto_bic",
-        "laplacian": "L = I - Dv^{-1/2} * (H * De^{-1} * H^T) * Dv^{-1/2}",
-        "seed": seed,
-        "min_contig_len": int(min_contig_len),
-        "min_contig_len_method": min_contig_len_meta,
-        "min_bin_bp": int(MIN_BIN_BP),
-        "stop_rule": stop_rule,
-        "coverage_source": coverage_source,
-        "coverage_tsv": (str(cov_out) if cov_out.exists() else None),
-        **meta_bisect,
-    }
+        return {
+            "method": "spectral_v2_joint_contact_feature_hdbscan",
+            "spectral_v2_joint_enabled": True,
+            "lambda_contact": float(lambda_contact),
+            "d": int(d),
+            "knn_k": int(knn_k),
+            "dropped_edges_singleton_contact": int(contact.dropped_edges_singleton_contact),
+            "isolated_contigs_count_contact": int(np.sum(contact.isolated_mask_contact)),
+            "coverage_tsv": (str(cov_path) if cov_path is not None else None),
+            "coverage_used": bool(coverage_used),
+            "coverage_missing_count": int(coverage_missing_count),
+            "hdbscan": hmeta,
+            "contact_component_postprocess": {
+                "components_total": pp.components_total,
+                "components_promoted_from_noise": pp.components_promoted_from_noise,
+                "noise_reassigned_by_component": pp.noise_reassigned_by_component,
+                "labels_split_by_component": pp.labels_split_by_component,
+            },
+            "versions": {"scipy": getattr(scipy, "__version__", None), "sklearn": sklearn_version},
+            "num_bins": int(num_bins),
+            "unbinned_count": int(unbinned),
+        }
+    except JointSpectralError as exc:
+        raise GraphClusterError(str(exc)) from exc
 
 
 def cluster_leiden_pairwise(

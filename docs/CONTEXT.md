@@ -1,40 +1,44 @@
 # porebin context
 
 ## Goal
-Use Nanopore Pore-C multi-way contacts for metagenome binning while preserving hyperedges (no clique expansion).
+Host-centric metagenome binning from Nanopore Pore-C multi-way contacts while preserving hyperedges (no clique expansion).
 
-We represent each multi-way contact as a **hyperedge**, and keep the hyperedge structure via a **contig–contact bipartite graph**:
+Primary goal:
+- output bins corresponding to host genomes / host communities.
+
+Secondary goal:
+- output conservative structural association summaries for accessory / MGE-like contigs (not a hard classifier).
+
+We represent each multi-way contact as a **hyperedge**, and keep the hyperedge structure via a **contig–contact bipartite view**:
 - Left nodes: contigs
 - Right nodes: contacts (hyperedges)
 - Edge exists if contig participates in the contact
-- Edge weight (v0.1): `OrderNorm(k) * weight`, with `OrderNorm(k)=2/(k*(k-1))` (skip `k<2`)
+- Evidence-layer edge mass is governed by the read-level quality weight `q(r)` (stored as `contacts.parquet.weight`),
+  plus the normalized evidence share `pi_{r,c}` (stored as `contacts.parquet.contig_weights`).
 
 ## Pipeline
-1) `porebin run`: normalize → build bipartite graph → cluster (coarse `bins.tsv`)
-2) `porebin refine`: recruit/decontam/split with built-in defaults/auto-thresholds → `bins.refined.tsv`
-3) `porebin export`: export FASTA with built-in policy (keep bins ≥200kb; short contigs/tiny bins → `unbinned.fasta`)
+1) `porebin run-bam`: BAM → contacts.parquet → build graph (audit/artifacts) → coarse cluster (`bins.tsv`, candidate host communities) → (optional) refine inference (`bins.refined.tsv`)
+2) `porebin export`: export FASTA with built-in policy (keep bins ≥200kb; short contigs/tiny bins → `unbinned.fasta`)
 
-Experimental (branch): coarse clustering can be switched to hypergraph spectral clustering
-(`--coarse-method spectral` / `--method spectral`), which uses a normalized hypergraph Laplacian
-and k-means on the leading eigenvectors.
+Coarse clustering (`spectral` in v0.1.0) uses a **joint hypergraph spectral embedding**
+(contact hypergraph + feature hypergraph) followed by **HDBSCAN** (no fixed K, no recursive BIC bisection).
 
-## PPL `.contacts` (segment-level TSV)
-The normalizer expects a TSV produced by PPL-Toolbox with **11 or 12 columns**, with or without header.
+Refine is a host-assignment inference layer:
+- outputs per-contig host support / posterior-like scores `theta_{c,b}` (not to be confused with `pi_{r,c}`)
+- outputs uncertainty summaries (top1/top2/margin/entropy/effective_hosts)
+- outputs a separate accessory association head (structural, conservative)
 
-Required semantics per segment row:
-- `readID`: read identifier (used to group segments into a contact)
-- `chr`: contig/reference name (used to build contig set per read)
-- `status`: used for filtering/weighting (most steps use `passed` only by default)
-- `score` (optional): may contain tags like `mapq:60;AS:123` (parsed if present)
+## BAM (name-sorted)
+We treat each read (QNAME) as one hyperedge, so the BAM must be queryname-sorted (e.g. `samtools sort -n`).
 
-`porebin normalize` aggregates by `readID` (for best memory usage, the file should be grouped by readID):
-- `contigs = unique(chr)` per read
-- drop contacts with `k=len(contigs) < 2`
+`porebin bam2contacts` aggregates per QNAME and writes `out_dir/contacts/contacts.parquet`.
 
 Output internal format: `out_dir/contacts/contacts.parquet` with columns:
 - `contact_id` (int)
 - `contigs` (list[str])
+- `contig_weights` (list[float], normalized evidence shares \(\\pi_{r,c}\); sums to 1 over contigs touched by the read; not a posterior)
 - `k` (int)
-- `weight` (float, currently 1.0)
-- `support_count` (int, currently 1)
-- optional evidence columns (enabled via `--include-tags`): `mapq_min`, `mapq_mean`, `as_sum`, `n_segments`
+- `k_eff` (float)
+- `weight` (float, read quality weight \(q(r)\), clamped to [0,1]; no multi-way concentration penalty)
+- `support_count` (int)
+- evidence/QC columns: `mapq_min`, `p_ok_mean`, `aligned_len_sum`, `nm_sum`, `n_segments`, `mapq_missing_count`, `nm_missing_count`, `len_missing_count`

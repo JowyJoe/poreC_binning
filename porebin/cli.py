@@ -9,14 +9,12 @@ from porebin.bam_contacts import BamContactsError, bam_to_contacts_parquet
 from porebin.build_graph import GraphBuildError, build_graph
 from porebin.cluster import (
     GraphClusterError,
-    cluster_leiden,
     cluster_leiden_pairwise,
     cluster_spectral_hypergraph,
 )
 from porebin.export import ExportError, MIN_BIN_BP, export_bins
-from porebin.normalize import NormalizeError, normalize_contacts
-from porebin.pairwise_baseline import PairwiseBaselineError, build_pairwise_edges
-from porebin.refine import RefineError, refine_bins, refine_bins_parquet
+from porebin.pairwise_baseline import PairwiseBaselineError, build_pairwise_edges_from_bam
+from porebin.refine import RefineError, refine_bins_parquet
 from porebin.utils import (
     console,
     ensure_dir,
@@ -46,7 +44,7 @@ def bam2contacts(
     """
     Build our internal hyperedge format (contacts.parquet) directly from a name-sorted BAM.
 
-    This is the recommended entrypoint when abandoning PPL .contacts.
+    This is the recommended entrypoint for BAM-based pipelines.
     """
     out = out.resolve()
     params = {
@@ -75,51 +73,9 @@ def bam2contacts(
 
 
 @app.command()
-def normalize(
-    ppl_contacts: Path = typer.Option(..., "--ppl-contacts", help="PPL .contacts TSV file."),
-    out: Path = typer.Option(..., "--out", help="Output directory."),
-    threads: int = typer.Option(1, "--threads", help="Threads hint (v0.1 mostly single-threaded)."),
-    include_tags: list[str] = typer.Option(
-        ["mapq", "AS", "n_segments"],
-        "--include-tags",
-        help="Evidence to include: mapq, AS, n_segments, all. Repeatable.",
-    ),
-    keep_status: list[str] = typer.Option(
-        ["passed"],
-        "--keep-status",
-        help="Keep segments with these status labels (default: passed). Use --keep-status all to keep all.",
-    ),
-    assume_no_header: bool = typer.Option(
-        False, "--assume-no-header", help="Treat first line as data (no header)."
-    ),
-) -> None:
-    out = out.resolve()
-    params = {
-        "ppl_contacts": str(ppl_contacts),
-        "out": str(out),
-        "threads": threads,
-        "include_tags": include_tags,
-        "keep_status": keep_status,
-        "assume_no_header": assume_no_header,
-    }
-    with record_run(out, command="normalize", params=params, seed=None):
-        try:
-            normalize_contacts(
-                ppl_contacts=ppl_contacts,
-                out_dir=out,
-                include_tags=include_tags,
-                keep_status=keep_status,
-                assume_no_header=assume_no_header,
-                threads=threads,
-            )
-        except (NormalizeError, FileNotFoundError) as exc:
-            _die(str(exc))
-
-
-@app.command()
 def build(
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
-    contacts: Path = typer.Option(..., "--contacts", help="Contacts Parquet file (from normalize or bam2contacts)."),
+    contacts: Path = typer.Option(..., "--contacts", help="Contacts Parquet file (from bam2contacts)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
     order_norm_method: str = typer.Option(
         "pair", "--order-norm", help="OrderNorm: pair (2/(k*(k-1))) or star (1/(k-1))."
@@ -152,16 +108,15 @@ def cluster(
     graph: Path = typer.Option(..., "--graph", help="Graph directory (out_dir/graph)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
     method: str = typer.Option(
-        "leiden",
+        "spectral",
         "--method",
-        help="Clustering method: leiden (default) or spectral (experimental hypergraph Laplacian).",
+        help="Clustering method: spectral (joint hypergraph spectral embedding + HDBSCAN).",
     ),
-    resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter."),
-    seed: int = typer.Option(0, "--seed", help="Random seed for Leiden."),
+    seed: int = typer.Option(0, "--seed", help="Random seed."),
     bam: Path | None = typer.Option(
         None,
         "--bam",
-        help="Optional BAM (spectral only): enables coverage-guided divisive spectral bisection (no fixed K).",
+        help="Optional (kept for backwards compatibility; currently unused by spectral v2).",
     ),
 ) -> None:
     out = out.resolve()
@@ -169,31 +124,23 @@ def cluster(
         "graph": str(graph),
         "out": str(out),
         "method": method,
-        "resolution": resolution,
         "seed": seed,
         "bam": str(bam) if bam is not None else None,
     }
     with record_run(out, command="cluster", params=params, seed=seed) as run_record:
         try:
             m = method.strip().lower()
-            if m == "leiden":
-                cluster_leiden(
-                    graph_dir=graph,
-                    out_bins_tsv=out / "bins.tsv",
-                    resolution=resolution,
-                    seed=seed,
-                )
-                run_record["decisions"] = {"cluster_method": "leiden", "resolution": resolution}
-            elif m == "spectral":
+            if m == "spectral":
                 meta = cluster_spectral_hypergraph(
                     graph_dir=graph,
                     out_bins_tsv=out / "bins.tsv",
                     seed=seed,
                     bam=bam,
+                    threads=1,
                 )
                 run_record["decisions"] = {"cluster_method": "spectral", **meta}
             else:
-                _die(f"Unknown --method {method!r}. Use 'leiden' or 'spectral'.")
+                _die(f"Unknown --method {method!r}. Use 'spectral'.")
         except (GraphClusterError, FileNotFoundError) as exc:
             _die(str(exc))
 
@@ -232,17 +179,9 @@ def export(
 def refine(
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
     bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Coarse bins TSV (e.g. coarse/bins.tsv)."),
-    ppl_contacts: Path | None = typer.Option(
-        None, "--ppl-contacts", help="Legacy mode: PPL .contacts TSV file (segment-level)."
-    ),
-    contacts: Path | None = typer.Option(
-        None, "--contacts", help="BAM/parquet mode: contacts.parquet produced by bam2contacts."
-    ),
+    contacts: Path = typer.Option(..., "--contacts", help="contacts.parquet produced by bam2contacts."),
     coverage_tsv: Path | None = typer.Option(
         None, "--coverage-tsv", help="Optional coverage TSV (contig_name\\tcoverage)."
-    ),
-    bam: Path | None = typer.Option(
-        None, "--bam", help="Optional BAM (legacy refine only): enables coverage-guided heuristics."
     ),
     out: Path = typer.Option(..., "--out", help="Output directory (refined/)."),
     threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
@@ -252,118 +191,101 @@ def refine(
     params = {
         "contigs": str(contigs),
         "bins_tsv": str(bins_tsv),
-        "ppl_contacts": str(ppl_contacts) if ppl_contacts is not None else None,
-        "contacts": str(contacts) if contacts is not None else None,
+        "contacts": str(contacts),
         "coverage_tsv": str(coverage_tsv) if coverage_tsv is not None else None,
-        "bam": str(bam) if bam is not None else None,
         "out": str(out),
         "threads": threads,
         "seed": seed,
     }
-    # refine writes out/run_refine.json with all thresholds and decisions.
+    # refine is a host-assignment inference layer on top of coarse candidate host communities.
+    # It writes out/run_refine.json plus:
+    #   - bins.refined.tsv (core-like contigs only)
+    #   - contig_host_scores.tsv (all contigs)
+    #   - accessory_associations.tsv (accessory/MGE-like association head)
     with record_run(out, command="refine", params=params, seed=seed):
         try:
-            if (ppl_contacts is None and contacts is None) or (ppl_contacts is not None and contacts is not None):
-                _die("Provide exactly one of --ppl-contacts (legacy) or --contacts (bam/parquet).")
-            if contacts is not None:
-                refine_bins_parquet(
-                    contigs_fasta=contigs,
-                    contacts_parquet=contacts,
-                    bins_tsv=bins_tsv,
-                    coverage_tsv=coverage_tsv,
-                    out_dir=out,
-                    threads=threads,
-                    seed=seed,
-                )
-            else:
-                refine_bins(
-                    contigs_fasta=contigs,
-                    ppl_contacts=ppl_contacts,  # type: ignore[arg-type]
-                    bins_tsv=bins_tsv,
-                    bam=bam,
-                    out_dir=out,
-                    threads=threads,
-                    seed=seed,
-                )
+            refine_bins_parquet(
+                contigs_fasta=contigs,
+                contacts_parquet=contacts,
+                bins_tsv=bins_tsv,
+                coverage_tsv=coverage_tsv,
+                out_dir=out,
+                threads=threads,
+                seed=seed,
+            )
         except (RefineError, FileNotFoundError) as exc:
             _die(str(exc))
 
 
-@app.command()
-def run(
-    ppl_contacts: Path = typer.Option(..., "--ppl-contacts", help="PPL .contacts TSV file."),
+@app.command("run-bam")
+def run_bam(
+    bam: Path = typer.Option(..., "--bam", help="Name-sorted BAM (samtools sort -n)."),
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
-    bam: Path | None = typer.Option(
-        None,
-        "--bam",
-        help="Optional BAM (spectral coarse only): enables coverage-guided divisive spectral bisection.",
-    ),
+    seed: int = typer.Option(0, "--seed", help="Random seed."),
+    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
     pairwise_baseline: bool = typer.Option(
         False,
         "--pairwise-baseline",
-        help="Run pairwise clique-expansion baseline (contig-contig graph) instead of bipartite hypergraph.",
-    ),
-    resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter."),
-    seed: int = typer.Option(0, "--seed", help="Random seed for Leiden."),
-    threads: int = typer.Option(1, "--threads", help="Threads hint (v0.1 mostly single-threaded)."),
-    include_tags: list[str] = typer.Option(
-        ["mapq", "AS", "n_segments"],
-        "--include-tags",
-        help="Evidence to include: mapq, AS, n_segments, all. Repeatable.",
-    ),
-    keep_status: list[str] = typer.Option(
-        ["passed"],
-        "--keep-status",
-        help="Keep segments with these status labels (default: passed). Use --keep-status all to keep all.",
-    ),
-    assume_sorted_by_readid: bool = typer.Option(
-        False,
-        "--assume-sorted-by-readid",
-        help="Pairwise baseline only: skip sortedness check and assume input is grouped by readID (column 4).",
+        help="Run pairwise clique-expansion baseline from BAM (contig-contig graph) instead of hypergraph pipeline.",
     ),
     pairwise_sort_memory: str | None = typer.Option(
         None,
         "--pairwise-sort-memory",
         help="Pairwise baseline only: GNU sort memory for -S (e.g. 8G or 50%).",
     ),
-    assume_no_header: bool = typer.Option(
-        False, "--assume-no-header", help="Treat first line as data (no header)."
+    pairwise_chunk_lines: int = typer.Option(
+        5_000_000,
+        "--pairwise-chunk-lines",
+        help="Pairwise baseline only: raw pair lines per part before rotating output.",
     ),
     order_norm_method: str = typer.Option(
         "pair", "--order-norm", help="OrderNorm: pair (2/(k*(k-1))) or star (1/(k-1))."
     ),
-    parquet_batch_size: int = typer.Option(100_000, "--parquet-batch-size", help="Parquet batch size."),
+    contacts_parquet_batch_size: int = typer.Option(
+        10_000, "--contacts-parquet-batch-size", help="Parquet batch size for bam2contacts output."
+    ),
+    build_parquet_batch_size: int = typer.Option(100_000, "--build-parquet-batch-size", help="Parquet batch size for build."),
     coarse_method: str = typer.Option(
-        "leiden",
+        "spectral",
         "--coarse-method",
-        help="Coarse clustering method for hypergraph pipeline: leiden (default) or spectral (experimental).",
+        help="Coarse clustering method: spectral (joint hypergraph spectral embedding + HDBSCAN).",
+    ),
+    resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter (pairwise baseline only)."),
+    refine: bool = typer.Option(
+        True,
+        "--refine/--no-refine",
+        help="Run refine after coarse binning (recommended for low contamination).",
     ),
 ) -> None:
+    """
+    End-to-end BAM pipeline:
+      - default (hypergraph): bam2contacts -> build -> coarse cluster -> (optional) refine
+      - baseline (--pairwise-baseline): BAM -> pairwise graph -> Leiden
+    """
     out = out.resolve()
     params = {
-        "ppl_contacts": str(ppl_contacts),
+        "bam": str(bam),
         "contigs": str(contigs),
         "out": str(out),
-        "bam": str(bam) if bam is not None else None,
-        "pairwise_baseline": pairwise_baseline,
-        "resolution": resolution,
         "seed": seed,
         "threads": threads,
-        "include_tags": include_tags,
-        "keep_status": keep_status,
-        "assume_sorted_by_readid": assume_sorted_by_readid,
+        "pairwise_baseline": pairwise_baseline,
         "pairwise_sort_memory": pairwise_sort_memory,
-        "assume_no_header": assume_no_header,
+        "pairwise_chunk_lines": int(pairwise_chunk_lines),
         "order_norm_method": order_norm_method,
-        "parquet_batch_size": parquet_batch_size,
+        "contacts_parquet_batch_size": contacts_parquet_batch_size,
+        "build_parquet_batch_size": build_parquet_batch_size,
         "coarse_method": coarse_method,
+        "resolution": resolution,
+        "refine": refine,
     }
-    with record_run(out, command="run", params=params, seed=seed) as run_record:
+    with record_run(out, command="run-bam", params=params, seed=seed) as run_record:
         try:
             if pairwise_baseline:
-                if coarse_method.strip().lower() != "leiden":
-                    raise GraphClusterError("--coarse-method only applies to the hypergraph pipeline (without --pairwise-baseline).")
+                if refine:
+                    _die("--pairwise-baseline does not support --refine (baseline is intended as a coarse control).")
+
                 graph_dir = out / "graph"
                 ensure_dir(graph_dir)
 
@@ -385,13 +307,14 @@ def run(
                         fh.write(f"{name}\t{idx}\n")
 
                 pairwise_edges = graph_dir / "pairwise_edges.tsv.gz"
-                stats = build_pairwise_edges(
-                    contacts_path=ppl_contacts,
+                stats = build_pairwise_edges_from_bam(
+                    bam=bam,
+                    contigs_fasta=contigs,
                     out_edges_path=pairwise_edges,
                     tmp_dir=out / "tmp" / "pairwise_baseline",
-                    assume_sorted=assume_sorted_by_readid,
                     sort_threads=max(1, int(threads)),
                     memory=pairwise_sort_memory,
+                    chunk_lines=int(pairwise_chunk_lines),
                     logger=None,
                 )
 
@@ -399,14 +322,14 @@ def run(
                     "porebin_version": __version__,
                     "pairwise_baseline": True,
                     "weight_formula": "2/(k*(k-1))  # == 1/C(k,2)",
-                    "input_ppl_contacts": str(ppl_contacts),
+                    "input_bam": str(bam),
                     "input_contigs_fasta": str(contigs),
-                    "input_sorted_by_readid": stats.input_sorted_by_readid,
-                    "input_sorted_by_readid_verified": stats.input_sorted_by_readid_verified,
+                    "input_sorted_by_qname": stats.input_sorted_by_qname,
+                    "input_sorted_by_qname_verified": stats.input_sorted_by_qname_verified,
                     "num_contigs": len(contig_names),
                     "num_edges": stats.unique_edges,
-                    "segments_total": stats.segments_total,
-                    "segments_kept": stats.segments_kept,
+                    "alignments_total": stats.alignments_total,
+                    "alignments_kept": stats.alignments_kept,
                     "reads_total": stats.reads_total,
                     "reads_skipped_k_lt_2": stats.reads_skipped_k_lt_2,
                     "raw_pairs_written": stats.raw_pairs_written,
@@ -425,97 +348,15 @@ def run(
                     resolution=resolution,
                     seed=seed,
                 )
-                run_record["decisions"] = {"cluster_method": "leiden_pairwise", "resolution": resolution}
-            else:
-                contacts_parquet = normalize_contacts(
-                    ppl_contacts=ppl_contacts,
-                    out_dir=out,
-                    include_tags=include_tags,
-                    keep_status=keep_status,
-                    assume_no_header=assume_no_header,
-                    threads=threads,
-                )
-                build_graph(
-                    contigs_fasta=contigs,
-                    contacts_parquet=contacts_parquet,
-                    out_dir=out,
-                    order_norm_method=order_norm_method,
-                    parquet_batch_size=parquet_batch_size,
-                )
-                m = coarse_method.strip().lower()
-                if m == "leiden":
-                    cluster_leiden(
-                        graph_dir=out / "graph",
-                        out_bins_tsv=out / "bins.tsv",
-                        resolution=resolution,
-                        seed=seed,
-                    )
-                    run_record["decisions"] = {"cluster_method": "leiden", "resolution": resolution}
-                elif m == "spectral":
-                    meta = cluster_spectral_hypergraph(
-                        graph_dir=out / "graph",
-                        out_bins_tsv=out / "bins.tsv",
-                        seed=seed,
-                        bam=bam,
-                    )
-                    run_record["decisions"] = {"cluster_method": "spectral", **meta}
-                else:
-                    raise GraphClusterError(f"Unknown --coarse-method {coarse_method!r}. Use 'leiden' or 'spectral'.")
-        except (
-            PairwiseBaselineError,
-            NormalizeError,
-            GraphBuildError,
-            GraphClusterError,
-            FileNotFoundError,
-        ) as exc:
-            _die(str(exc))
 
+                run_record["decisions"] = {"mode": "pairwise_baseline_bam", "cluster_method": "leiden_pairwise", "resolution": resolution}
+                run_record["outputs"] = {
+                    "graph_dir": str(graph_dir),
+                    "pairwise_edges_tsv_gz": str(pairwise_edges),
+                    "coarse_bins_tsv": str(out / "bins.tsv"),
+                }
+                return
 
-@app.command("run-bam")
-def run_bam(
-    bam: Path = typer.Option(..., "--bam", help="Name-sorted BAM (samtools sort -n)."),
-    contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
-    out: Path = typer.Option(..., "--out", help="Output directory."),
-    seed: int = typer.Option(0, "--seed", help="Random seed."),
-    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
-    order_norm_method: str = typer.Option(
-        "pair", "--order-norm", help="OrderNorm: pair (2/(k*(k-1))) or star (1/(k-1))."
-    ),
-    contacts_parquet_batch_size: int = typer.Option(
-        10_000, "--contacts-parquet-batch-size", help="Parquet batch size for bam2contacts output."
-    ),
-    build_parquet_batch_size: int = typer.Option(100_000, "--build-parquet-batch-size", help="Parquet batch size for build."),
-    coarse_method: str = typer.Option(
-        "spectral",
-        "--coarse-method",
-        help="Coarse clustering method: spectral (default) or leiden.",
-    ),
-    resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter (leiden only)."),
-    refine: bool = typer.Option(
-        True,
-        "--refine/--no-refine",
-        help="Run refine after coarse binning (recommended for low contamination).",
-    ),
-) -> None:
-    """
-    End-to-end BAM pipeline: bam2contacts -> build -> coarse cluster -> (optional) refine.
-    """
-    out = out.resolve()
-    params = {
-        "bam": str(bam),
-        "contigs": str(contigs),
-        "out": str(out),
-        "seed": seed,
-        "threads": threads,
-        "order_norm_method": order_norm_method,
-        "contacts_parquet_batch_size": contacts_parquet_batch_size,
-        "build_parquet_batch_size": build_parquet_batch_size,
-        "coarse_method": coarse_method,
-        "resolution": resolution,
-        "refine": refine,
-    }
-    with record_run(out, command="run-bam", params=params, seed=seed) as run_record:
-        try:
             cmeta = bam_to_contacts_parquet(
                 bam=bam,
                 contigs_fasta=contigs,
@@ -535,23 +376,16 @@ def run_bam(
             )
 
             m = coarse_method.strip().lower()
-            if m == "leiden":
-                cluster_leiden(
-                    graph_dir=out / "graph",
-                    out_bins_tsv=out / "bins.tsv",
-                    resolution=resolution,
-                    seed=seed,
-                )
-                coarse_meta = {"cluster_method": "leiden", "resolution": resolution}
-            elif m == "spectral":
+            if m == "spectral":
                 coarse_meta = cluster_spectral_hypergraph(
                     graph_dir=out / "graph",
                     out_bins_tsv=out / "bins.tsv",
                     seed=seed,
                     bam=None,
+                    threads=threads,
                 )
             else:
-                raise GraphClusterError(f"Unknown --coarse-method {coarse_method!r}. Use 'leiden' or 'spectral'.")
+                raise GraphClusterError(f"Unknown --coarse-method {coarse_method!r}. Use 'spectral'.")
 
             refined_bins = None
             if refine:
@@ -578,7 +412,7 @@ def run_bam(
                 "coarse_bins_tsv": str(out / "bins.tsv"),
                 "refined_bins_tsv": (str(refined_bins) if refined_bins is not None else None),
             }
-        except (BamContactsError, GraphBuildError, GraphClusterError, RefineError, FileNotFoundError) as exc:
+        except (BamContactsError, PairwiseBaselineError, GraphBuildError, GraphClusterError, RefineError, FileNotFoundError) as exc:
             _die(str(exc))
 
 

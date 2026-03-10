@@ -70,6 +70,7 @@ def build_graph(
     ensure_dir(out_graph_dir)
 
     contig_index_path = out_graph_dir / "contig_index.tsv"
+    contigs_tsv_path = out_graph_dir / "contigs.tsv"
     edges_path = out_graph_dir / "edges.tsv"
     contacts_meta_path = out_graph_dir / "contacts_meta.tsv"
     graph_meta_path = out_graph_dir / "graph_meta.json"
@@ -220,6 +221,12 @@ def build_graph(
         fh.write("contig_name\tcontig_idx\n")
         for idx, name in enumerate(contig_names):
             fh.write(f"{name}\t{idx}\n")
+
+    # v2 spectral clustering uses a stable contig index file without a header.
+    # Format (required): contig_idx<TAB>contig_name
+    with contigs_tsv_path.open("w", encoding="utf-8", newline="") as fh:
+        for idx, name in enumerate(contig_names):
+            fh.write(f"{idx}\t{name}\n")
 
     meta: dict[str, Any] = {
         "porebin_version": __version__,

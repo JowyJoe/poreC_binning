@@ -38,6 +38,12 @@ def export_bins(
     threads: int = 1,
     logger: Optional[logging.Logger] = None,
 ) -> ExportStats:
+    """
+    Export FASTA bins from a contig->bin assignment (bins.tsv).
+
+    This is a presentation/export layer. Thresholds here (e.g. MIN_BIN_BP) must not be used to
+    drive inference decisions in refine.
+    """
     logger = logger or logging.getLogger("porebin")
     out_dir = out_dir.resolve()
     ensure_dir(out_dir)

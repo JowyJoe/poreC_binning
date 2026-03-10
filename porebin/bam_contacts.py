@@ -27,6 +27,17 @@ class BamContactsStats:
     alignments_skipped_unmapped: int = 0
     alignments_skipped_secondary: int = 0
     alignments_skipped_missing_ref: int = 0
+    alignments_skipped_len_missing: int = 0
+
+    # Per-alignment missingness counters (across the whole BAM).
+    # These are also recorded per-contact in contacts.parquet.
+    mapq_missing_count: int = 0  # MAPQ==255 ("unknown") or missing/invalid MAPQ
+    nm_missing_count: int = 0  # NM tag missing
+    len_missing_count: int = 0  # alignment length missing (both query len and ref span unavailable)
+
+    # de-overlap (per read+contig) statistics
+    overlap_blocks_created_total: int = 0
+    overlap_segments_merged_total: int = 0
 
     k_counter: Counter[int] = None  # set in __post_init__
     weight_min: Optional[float] = None
@@ -65,20 +76,31 @@ def bam_to_contacts_parquet(
     Mathematical definition (see docs/BAM_HYPERGRAPH_SPECTRAL_PIPELINE.md):
       - Each read r (QNAME) forms one hyperedge/contact.
       - For each alignment a in r, define evidence:
-          p_ok(a) = 1 - 10^(-MAPQ(a)/10)   (MAPQ=255 treated as unknown -> 0)
-          id(a)   = max(0, 1 - NM(a)/aligned_len(a))   (if NM missing: id(a)=1)
+          aligned_len(a) = query_alignment_length (preferred);
+                           else: reference_end - reference_start;
+                           else: skip this alignment and count len_missing_count.
+          p_ok(a) = 1 - 10^(-MAPQ(a)/10) for MAPQ in normal range
+                   = 0.5               for MAPQ==255 ("unknown") or missing/invalid MAPQ
+          id(a)   = max(0, 1 - NM(a)/aligned_len(a)) if NM tag present
+                   = 1                  if NM tag missing (count nm_missing_count)
           e(a)    = p_ok(a) * id(a) * aligned_len(a)
       - Aggregate per contig: E_{r,c} = sum_{a:ref=c} e(a)
-      - Soft assignment:        P_{r,c} = E_{r,c} / sum_{c'} E_{r,c'}
-      - Concentration:          C(r) = sum_c P_{r,c}^2
-      - Read reliability:       R(r) = mean_len_weighted(p_ok(a)) * C(r)
+      - Normalized evidence share (soft incidence weight):
+                               pi_{r,c} = E_{r,c} / sum_{c'} E_{r,c'}
+        NOTE: pi_{r,c} are evidence shares, not posterior probabilities.
+      - Concentration (QC only): C(r) = sum_c pi_{r,c}^2
+      - Effective order (QC only): k_eff(r) = 1/C(r)
+      - Read quality weight (no multi-way penalty):
+          q(r) = (sum_a p_ok(a)*id(a)*aligned_len(a)) / (sum_a aligned_len(a))
+          weight = clamp(q(r), 0, 1)
       - We output:
           contigs = [c...]
-          contig_weights = [P_{r,c}...]
+          contig_weights = [pi_{r,c}...]
           k = len(contigs)
-          weight = R(r)
+          k_eff = 1/C(r)
+          weight = q(r)
         Downstream graph uses incidence weight:
-          edge_weight(c,r) = OrderNorm(k) * weight * contig_weight
+          edge_weight(c,r) = OrderNorm(k) * q(r) * pi_{r,c}
     """
     logger = logger or logging.getLogger("porebin")
     out_dir = out_dir.resolve()
@@ -128,16 +150,20 @@ def bam_to_contacts_parquet(
         [
             ("contact_id", pa.int64()),
             ("contigs", pa.list_(pa.string())),
-            ("contig_weights", pa.list_(pa.float64())),  # P_{r,c}
+            ("contig_weights", pa.list_(pa.float64())),  # pi_{r,c} (normalized evidence shares)
             ("k", pa.int32()),
             ("k_eff", pa.float64()),
-            ("weight", pa.float64()),  # R(r) in (0,1]
+            ("weight", pa.float64()),  # q(r) in [0,1]
             ("support_count", pa.int32()),
             ("n_segments", pa.int32()),
             ("mapq_min", pa.int32()),
             ("p_ok_mean", pa.float64()),
             ("aligned_len_sum", pa.int64()),
+            ("deoverlap_query_union_len_sum", pa.int64()),
             ("nm_sum", pa.int64()),
+            ("mapq_missing_count", pa.int32()),
+            ("nm_missing_count", pa.int32()),
+            ("len_missing_count", pa.int32()),
         ]
     )
 
@@ -154,14 +180,25 @@ def bam_to_contacts_parquet(
         for k in buffer:
             buffer[k].clear()
 
-    def p_ok_from_mapq(mapq: int) -> float:
-        # MAPQ=255 means "mapping quality not available" (SAM spec) -> treat as unknown/low confidence.
-        m = int(mapq)
-        if m < 0:
-            m = 0
-        if m >= 255:
-            m = 0
-        return 1.0 - (10.0 ** (-m / 10.0))
+    def mapq_to_p_ok(mapq_raw: Any) -> tuple[float, bool, int]:
+        """
+        Convert MAPQ to p_ok(a) with a missing-value strategy.
+
+        Code-level definition (must match docs/ and tests):
+          - If MAPQ is missing/invalid (None, <0, non-int) OR MAPQ==255 ("unknown"):
+              p_ok(a) = 0.5, and mapq_missing_count is incremented.
+          - Otherwise:
+              p_ok(a) = 1 - 10^(-MAPQ/10).
+
+        Returns (p_ok, is_missing, mapq_for_qc), where mapq_for_qc is 255 for missing/unknown.
+        """
+        try:
+            m = int(mapq_raw)
+        except Exception:
+            return 0.5, True, 255
+        if m == 255 or m < 0 or m > 255:
+            return 0.5, True, 255
+        return 1.0 - (10.0 ** (-m / 10.0)), False, m
 
     def emit_contact(
         *,
@@ -175,7 +212,11 @@ def bam_to_contacts_parquet(
         mapq_min: int,
         p_ok_mean: float,
         aligned_len_sum: int,
+        deoverlap_query_union_len_sum: int,
         nm_sum: int,
+        mapq_missing_count: int,
+        nm_missing_count: int,
+        len_missing_count: int,
     ) -> None:
         buffer["contact_id"].append(int(contact_id))
         buffer["contigs"].append(contigs)
@@ -188,7 +229,11 @@ def bam_to_contacts_parquet(
         buffer["mapq_min"].append(int(mapq_min))
         buffer["p_ok_mean"].append(float(p_ok_mean))
         buffer["aligned_len_sum"].append(int(aligned_len_sum))
+        buffer["deoverlap_query_union_len_sum"].append(int(deoverlap_query_union_len_sum))
         buffer["nm_sum"].append(int(nm_sum))
+        buffer["mapq_missing_count"].append(int(mapq_missing_count))
+        buffer["nm_missing_count"].append(int(nm_missing_count))
+        buffer["len_missing_count"].append(int(len_missing_count))
         if len(buffer["contact_id"]) >= int(parquet_batch_size):
             flush_buffer()
 
@@ -211,44 +256,136 @@ def bam_to_contacts_parquet(
     prev_qname: Optional[str] = None if enforce_lex_monotone else None
 
     # Per-read accumulators
-    E_rc: dict[str, float] = {}
+    # We store per-contig segments and perform de-overlap in flush_read() to avoid double-counting
+    # query overlaps from split/supplementary alignments (minimap2).
+    segments_by_contig: dict[str, list[tuple[int, int, float, float]]] = {}
     seg_count = 0
     mapq_min: Optional[int] = None
     mapq_sum_lenw = 0.0
+    q_num = 0.0  # sum_a p_ok(a)*id(a)*aligned_len(a)
     len_sum = 0
     nm_sum = 0
+    mapq_missing = 0
+    nm_missing = 0
+    len_missing = 0
 
     contact_id = 0
 
     def flush_read() -> None:
         nonlocal contact_id
-        nonlocal E_rc, seg_count, mapq_min, mapq_sum_lenw, len_sum, nm_sum
+        nonlocal segments_by_contig, seg_count, mapq_min, mapq_sum_lenw, q_num, len_sum, nm_sum
+        nonlocal mapq_missing, nm_missing, len_missing
 
         if current_qname is None:
             return
 
         stats.reads_total += 1
 
-        if not E_rc:
+        if not segments_by_contig:
             stats.reads_skipped_no_evidence += 1
-            E_rc = {}
+            segments_by_contig = {}
             seg_count = 0
             mapq_min = None
             mapq_sum_lenw = 0.0
+            q_num = 0.0
             len_sum = 0
             nm_sum = 0
+            mapq_missing = 0
+            nm_missing = 0
+            len_missing = 0
             return
+
+        # De-overlap within each contig group using query coordinate blocks. Only merge if overlap > 0
+        # (do NOT merge merely adjacent segments) to avoid over-merging.
+        E_rc: dict[str, float] = {}
+        deoverlap_union_len_sum = 0
+        blocks_created = 0
+        segments_merged = 0
+
+        for contig, segs in segments_by_contig.items():
+            if not segs:
+                continue
+            segs_sorted = sorted(segs, key=lambda s: (s[0], -s[1]))  # qstart asc, qend desc
+            num_original = len(segs_sorted)
+
+            blocks: list[tuple[int, int, list[tuple[int, int, float, float]]]] = []
+            b_start: Optional[int] = None
+            b_end: Optional[int] = None
+            b_segs: list[tuple[int, int, float, float]] = []
+
+            def close_block() -> None:
+                nonlocal b_start, b_end, b_segs
+                if b_start is None or b_end is None:
+                    return
+                blocks.append((int(b_start), int(b_end), b_segs))
+                b_start = None
+                b_end = None
+                b_segs = []
+
+            for qstart, qend, p_ok, id_est in segs_sorted:
+                if b_start is None:
+                    b_start = int(qstart)
+                    b_end = int(qend)
+                    b_segs = [(qstart, qend, p_ok, id_est)]
+                    continue
+
+                # Merge only if overlap > 0 (not merely adjacent).
+                assert b_end is not None
+                if int(qstart) < int(b_end) and int(qend) > int(b_start):
+                    b_end = max(int(b_end), int(qend))
+                    b_segs.append((qstart, qend, p_ok, id_est))
+                else:
+                    close_block()
+                    b_start = int(qstart)
+                    b_end = int(qend)
+                    b_segs = [(qstart, qend, p_ok, id_est)]
+
+            close_block()
+
+            num_blocks = len(blocks)
+            blocks_created += num_blocks
+            if num_original > num_blocks:
+                segments_merged += (num_original - num_blocks)
+
+            e_sum = 0.0
+            for bs, be, seg_list in blocks:
+                L_block = int(be) - int(bs)
+                if L_block <= 0:
+                    continue
+                denom = 0.0
+                p_num = 0.0
+                id_num = 0.0
+                for qs, qe, pp, ii in seg_list:
+                    cov_len = max(0, min(int(qe), int(be)) - max(int(qs), int(bs)))
+                    if cov_len <= 0:
+                        continue
+                    denom += float(cov_len)
+                    p_num += float(cov_len) * float(pp)
+                    id_num += float(cov_len) * float(ii)
+                if denom <= 0:
+                    continue
+                p_ok_block = float(p_num / denom)
+                id_block = float(id_num / denom)
+                e_sum += float(p_ok_block) * float(id_block) * float(L_block)
+                deoverlap_union_len_sum += int(L_block)
+
+            if e_sum > 0.0:
+                E_rc[str(contig)] = float(e_sum)
 
         # Normalize to P_{r,c}
         total_e = float(sum(E_rc.values()))
         if not (total_e > 0.0):
             stats.reads_skipped_no_evidence += 1
-            E_rc = {}
+            segments_by_contig = {}
             seg_count = 0
             mapq_min = None
             mapq_sum_lenw = 0.0
+            q_num = 0.0
             len_sum = 0
             nm_sum = 0
+            mapq_missing = 0
+            nm_missing = 0
+            len_missing = 0
             return
 
         contigs = list(E_rc.keys())
@@ -257,32 +394,32 @@ def bam_to_contacts_parquet(
         # hard order
         k = len(contigs)
         if k < 2:
+            # Keep the record in contacts.parquet for audit/debugging, but note it's not a usable
+            # hyperedge for graph building (build_graph skips k<2).
             stats.reads_skipped_k_lt_2 += 1
-            E_rc = {}
-            seg_count = 0
-            mapq_min = None
-            mapq_sum_lenw = 0.0
-            len_sum = 0
-            nm_sum = 0
-            return
 
         # Effective order and concentration
         c_simpson = float(sum(x * x for x in p))
         if c_simpson <= 0.0:
             stats.reads_skipped_no_evidence += 1
-            E_rc = {}
+            segments_by_contig = {}
             seg_count = 0
             mapq_min = None
             mapq_sum_lenw = 0.0
+            q_num = 0.0
             len_sum = 0
             nm_sum = 0
+            mapq_missing = 0
+            nm_missing = 0
+            len_missing = 0
             return
 
         k_eff = 1.0 / c_simpson
         p_ok_mean = (mapq_sum_lenw / float(len_sum)) if len_sum > 0 else 0.0
 
-        # Read reliability factor R(r) = mean(p_ok) * C(r)
-        weight = float(p_ok_mean * c_simpson)
+        # Read quality weight q(r) (no concentration penalty; multi-way is signal).
+        q = (q_num / float(len_sum)) if len_sum > 0 else 0.0
+        weight = float(max(0.0, min(1.0, q)))
 
         # Deterministic order: sort by descending P, tie-break by contig name.
         order = sorted(range(k), key=lambda i: (-p[i], contigs[i]))
@@ -297,33 +434,51 @@ def bam_to_contacts_parquet(
             k_eff=k_eff,
             weight=weight,
             n_segments=seg_count,
-            mapq_min=int(mapq_min) if mapq_min is not None else 0,
+            mapq_min=int(mapq_min) if mapq_min is not None else 255,
             p_ok_mean=float(p_ok_mean),
             aligned_len_sum=int(len_sum),
+            deoverlap_query_union_len_sum=int(deoverlap_union_len_sum),
             nm_sum=int(nm_sum),
+            mapq_missing_count=int(mapq_missing),
+            nm_missing_count=int(nm_missing),
+            len_missing_count=int(len_missing),
         )
 
         stats.reads_kept += 1
         stats.k_counter[k] += 1
         stats.add_weight(weight)
+        stats.overlap_blocks_created_total += int(blocks_created)
+        stats.overlap_segments_merged_total += int(segments_merged)
         contact_id += 1
 
-        E_rc = {}
+        segments_by_contig = {}
         seg_count = 0
         mapq_min = None
         mapq_sum_lenw = 0.0
+        q_num = 0.0
         len_sum = 0
         nm_sum = 0
+        mapq_missing = 0
+        nm_missing = 0
+        len_missing = 0
 
     for aln in bam_fh.fetch(until_eof=True):
         stats.alignments_total += 1
 
-        if aln.is_unmapped:
+        flag = int(getattr(aln, "flag", 0) or 0)
+        is_unmapped = bool(getattr(aln, "is_unmapped", False)) or ((flag & 0x4) != 0)
+        if is_unmapped:
             stats.alignments_skipped_unmapped += 1
             continue
-        if aln.is_secondary:
+        is_secondary = bool(getattr(aln, "is_secondary", False)) or ((flag & 0x100) != 0)
+        if is_secondary:
             stats.alignments_skipped_secondary += 1
             continue
+        is_supplementary = bool(getattr(aln, "is_supplementary", False)) or ((flag & 0x800) != 0)
+        if is_supplementary:
+            # minimap2: supplementary (0x800) encodes split/chimeric alignment segments; for Pore-C this
+            # is required to preserve multi-way contacts, so we keep these records.
+            stats.alignments_supplementary_used += 1
 
         qname = aln.query_name
         if not qname:
@@ -354,36 +509,68 @@ def bam_to_contacts_parquet(
             stats.alignments_skipped_missing_ref += 1
             continue
 
+        # aligned length ℓ(a) (bp)
         aln_len = int(aln.query_alignment_length or 0)
+        if aln_len <= 0 and aln.reference_start is not None and aln.reference_end is not None:
+            aln_len = int(aln.reference_end - aln.reference_start)
         if aln_len <= 0:
-            # fallback to reference span if available
-            if aln.reference_start is not None and aln.reference_end is not None:
-                aln_len = int(aln.reference_end - aln.reference_start)
-        if aln_len <= 0:
+            stats.alignments_skipped_len_missing += 1
+            stats.len_missing_count += 1
+            len_missing += 1
             continue
 
-        mapq = int(aln.mapping_quality or 0)
-        p_ok = p_ok_from_mapq(mapq)
+        # query interval [qstart, qend) is required for de-overlap
+        qstart_raw = getattr(aln, "query_alignment_start", None)
+        qend_raw = getattr(aln, "query_alignment_end", None)
+        if qstart_raw is None or qend_raw is None:
+            stats.alignments_skipped_len_missing += 1
+            stats.len_missing_count += 1
+            len_missing += 1
+            continue
+        qstart = int(qstart_raw)
+        qend = int(qend_raw)
+        if qend <= qstart:
+            stats.alignments_skipped_len_missing += 1
+            stats.len_missing_count += 1
+            len_missing += 1
+            continue
 
-        nm = 0
+        # MAPQ -> p_ok(a)
+        p_ok, mapq_is_missing, mapq_for_qc = mapq_to_p_ok(getattr(aln, "mapping_quality", None))
+        if mapq_is_missing:
+            stats.mapq_missing_count += 1
+            mapq_missing += 1
+
+        # NM -> id(a)
+        nm_val: Optional[int] = None
         try:
-            nm = int(aln.get_tag("NM"))
+            nm_val = int(aln.get_tag("NM"))
         except Exception:
-            nm = 0
-        id_est = 1.0
-        if aln_len > 0 and nm > 0:
-            id_est = max(0.0, 1.0 - (float(nm) / float(aln_len)))
+            nm_val = None
 
+        if nm_val is None:
+            stats.nm_missing_count += 1
+            nm_missing += 1
+            id_est = 1.0
+            nm_for_sum = 0
+        else:
+            id_est = max(0.0, 1.0 - (float(nm_val) / float(aln_len)))
+            nm_for_sum = int(nm_val)
+
+        # evidence e(a) and read-quality numerator
         e = float(p_ok * id_est * float(aln_len))
-        if e > 0.0:
-            E_rc[ref] = float(E_rc.get(ref, 0.0) + e)
+        # NOTE: E_{r,c} is computed in flush_read() after de-overlap; here we only accumulate
+        # the read-level quality numerator/denominator and store segments for later merging.
+        q_num += float(e)
 
         stats.alignments_kept += 1
         seg_count += 1
-        mapq_min = mapq if mapq_min is None else min(mapq_min, mapq)
+        mapq_min = mapq_for_qc if mapq_min is None else min(mapq_min, mapq_for_qc)
         mapq_sum_lenw += float(p_ok) * float(aln_len)
         len_sum += int(aln_len)
-        nm_sum += int(nm)
+        nm_sum += int(nm_for_sum)
+
+        segments_by_contig.setdefault(str(ref), []).append((qstart, qend, float(p_ok), float(id_est)))
 
         # coverage accumulation (continuous, no hard MAPQ threshold)
         aligned_bases_weighted[ref] += float(p_ok) * float(aln_len)
@@ -418,6 +605,18 @@ def bam_to_contacts_parquet(
             "alignments_skipped_unmapped": stats.alignments_skipped_unmapped,
             "alignments_skipped_secondary": stats.alignments_skipped_secondary,
             "alignments_skipped_missing_ref": stats.alignments_skipped_missing_ref,
+            "alignments_skipped_len_missing": stats.alignments_skipped_len_missing,
+            "alignments_supplementary_used": stats.alignments_supplementary_used,
+            "mapq_missing_count": stats.mapq_missing_count,
+            "nm_missing_count": stats.nm_missing_count,
+            "len_missing_count": stats.len_missing_count,
+            # UX-friendly aliases (requested; keep schema/backwards-compat fields above too):
+            "unmapped_skipped": stats.alignments_skipped_unmapped,
+            "secondary_skipped": stats.alignments_skipped_secondary,
+            "supplementary_used": stats.alignments_supplementary_used,
+            "deoverlap_enabled": True,
+            "overlap_blocks_created_total": stats.overlap_blocks_created_total,
+            "overlap_segments_merged_total": stats.overlap_segments_merged_total,
             "k_distribution": {str(k): v for k, v in stats.k_counter.items()},
             "weight_summary": {
                 "count": stats.weight_count,
@@ -428,9 +627,17 @@ def bam_to_contacts_parquet(
         },
         "notes": {
             "sortedness": "Streaming grouping requires queryname-sorted BAM (samtools sort -n).",
-            "secondary": "Secondary alignments are skipped to reduce multi-mapping noise.",
-            "mapq": "MAPQ converted to p_ok=1-10^(-MAPQ/10). MAPQ=255 treated as unknown -> 0.",
+            "flags": "Skip unmapped (0x4), skip secondary (0x100), keep primary+supplementary (0x800) to preserve Pore-C multi-way contacts.",
+            "mapq": "MAPQ converted to p_ok=1-10^(-MAPQ/10). MAPQ==255 or missing/invalid treated as unknown -> p_ok=0.5 (counted).",
+            "nm": "If NM tag is missing: id=1 and nm_missing_count is incremented.",
             "coverage": "coverage bases are accumulated as sum(p_ok * aligned_len) per contig.",
+            "weight": "weight=q(r)=sum(p_ok*id*len)/sum(len), clamped to [0,1] (no concentration penalty).",
+            "deoverlap": {
+                "enabled": True,
+                "scope": "within each read+contig",
+                "merge_rule": "merge segments only if query-interval overlap > 0; do not merge adjacent",
+                "block_stats": "p_ok/id are cov_len-weighted within each block; ℓ_block is query union length",
+            },
         },
     }
     write_json(out_qc, qc)
@@ -441,6 +648,13 @@ def bam_to_contacts_parquet(
         f"{stats.reads_total:,}",
         out_parquet,
         out_cov,
+    )
+
+    logger.info(
+        "BAM flags: alignments_skipped_unmapped=%s alignments_skipped_secondary=%s alignments_supplementary_used=%s",
+        f"{stats.alignments_skipped_unmapped:,}",
+        f"{stats.alignments_skipped_secondary:,}",
+        f"{stats.alignments_supplementary_used:,}",
     )
 
     return {"contacts_parquet": out_parquet, "coverage_tsv": out_cov, "qc_json": out_qc, "stats": qc["stats"]}
