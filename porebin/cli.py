@@ -113,6 +113,7 @@ def cluster(
         help="Clustering method: spectral (joint hypergraph spectral embedding + HDBSCAN).",
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed."),
+    threads: int = typer.Option(1, "--threads", help="Threads hint for coarse clustering."),
     bam: Path | None = typer.Option(
         None,
         "--bam",
@@ -125,6 +126,7 @@ def cluster(
         "out": str(out),
         "method": method,
         "seed": seed,
+        "threads": threads,
         "bam": str(bam) if bam is not None else None,
     }
     with record_run(out, command="cluster", params=params, seed=seed) as run_record:
@@ -136,7 +138,7 @@ def cluster(
                     out_bins_tsv=out / "bins.tsv",
                     seed=seed,
                     bam=bam,
-                    threads=1,
+                    threads=threads,
                 )
                 run_record["decisions"] = {"cluster_method": "spectral", **meta}
             else:
@@ -150,13 +152,12 @@ def export(
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
     bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Bins TSV (e.g. coarse/bins.tsv or refined/bins.refined.tsv)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
-    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
 ) -> None:
     out = out.resolve()
-    params = {"contigs": str(contigs), "bins_tsv": str(bins_tsv), "out": str(out), "threads": threads}
+    params = {"contigs": str(contigs), "bins_tsv": str(bins_tsv), "out": str(out)}
     with record_run(out, command="export", params=params, seed=None) as run_record:
         try:
-            stats = export_bins(contigs_fasta=contigs, bins_tsv=bins_tsv, out_dir=out, threads=threads)
+            stats = export_bins(contigs_fasta=contigs, bins_tsv=bins_tsv, out_dir=out)
             run_record["thresholds"] = {"MIN_BIN_BP": MIN_BIN_BP}
             run_record["decisions"] = {
                 "export_policy": "keep_bins = total_bp >= MIN_BIN_BP; others -> unbinned.fasta",
@@ -184,8 +185,6 @@ def refine(
         None, "--coverage-tsv", help="Optional coverage TSV (contig_name\\tcoverage)."
     ),
     out: Path = typer.Option(..., "--out", help="Output directory (refined/)."),
-    threads: int = typer.Option(1, "--threads", help="Threads hint (currently mostly single-threaded)."),
-    seed: int = typer.Option(0, "--seed", help="Random seed (used for split partition if enabled)."),
 ) -> None:
     out = out.resolve()
     params = {
@@ -194,15 +193,13 @@ def refine(
         "contacts": str(contacts),
         "coverage_tsv": str(coverage_tsv) if coverage_tsv is not None else None,
         "out": str(out),
-        "threads": threads,
-        "seed": seed,
     }
     # refine is a host-assignment inference layer on top of coarse candidate host communities.
     # It writes out/run_refine.json plus:
     #   - bins.refined.tsv (core-like contigs only)
     #   - contig_host_scores.tsv (all contigs)
     #   - accessory_associations.tsv (accessory/MGE-like association head)
-    with record_run(out, command="refine", params=params, seed=seed):
+    with record_run(out, command="refine", params=params, seed=None):
         try:
             refine_bins_parquet(
                 contigs_fasta=contigs,
@@ -210,8 +207,6 @@ def refine(
                 bins_tsv=bins_tsv,
                 coverage_tsv=coverage_tsv,
                 out_dir=out,
-                threads=threads,
-                seed=seed,
             )
         except (RefineError, FileNotFoundError) as exc:
             _die(str(exc))
@@ -396,8 +391,6 @@ def run_bam(
                     bins_tsv=out / "bins.tsv",
                     coverage_tsv=coverage_tsv if coverage_tsv.exists() else None,
                     out_dir=refined_dir,
-                    threads=threads,
-                    seed=seed,
                 )
 
             run_record["decisions"] = {

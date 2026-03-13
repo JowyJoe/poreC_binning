@@ -48,6 +48,27 @@ In this path:
 - coarse clustering uses the joint contact-feature hypergraph spectral path
 - refine uses the parquet-based host-assignment inference path
 
+### 1.2.1 `seed` and `threads` in the current main path
+
+For the current CLI/main path, the intended parameter semantics are:
+
+- `seed` is a coarse-clustering control
+- `threads` is a coarse-clustering / pairwise-baseline resource control
+
+Current active behavior:
+
+- `porebin cluster --seed` affects the spectral coarse path by controlling the random initialization used by the eigensolver
+- `porebin cluster --threads` affects the spectral coarse path where HDBSCAN parallelism is available
+- `porebin run-bam --seed` feeds the coarse clustering stage and the pairwise-baseline Leiden partition when that baseline mode is used
+- `porebin run-bam --threads` feeds the coarse clustering stage and pairwise-baseline external sort / reduction path when that baseline mode is used
+- the current parquet refine main path does not expose or consume dedicated `seed` / `threads` controls
+- the current export path is effectively single-threaded and does not expose a dedicated `threads` control
+
+Important distinction:
+
+- the repository still contains older/auxiliary helpers where `seed` is used inside refine/splitting logic
+- that does not change the current main-path CLI semantics described above
+
 ### 1.3 Legacy paths still present
 
 The repository also contains older or auxiliary paths:
@@ -311,6 +332,8 @@ Implementation:
 - drop the first trivial vector
 - row-normalize the remaining embedding
 - cluster the embedding using HDBSCAN
+- `seed` controls the eigensolver initialization vector
+- `threads` is passed to HDBSCAN when the implementation supports parallel core-distance computation
 
 This produces coarse bins interpreted as candidate host communities.
 
@@ -319,6 +342,11 @@ This produces coarse bins interpreted as candidate host communities.
 The current refine path is `refine_bins_parquet(...)`.
 
 Coarse bins are not treated as final truth. They are candidate host communities.
+
+Implementation note for the current main path:
+
+- the active parquet refine CLI path is currently deterministic with respect to explicit user `seed` / `threads` controls
+- `_split_bins_parquet(...)` exists in the repository as an auxiliary parquet split helper, but it is not currently wired into the main-path CLI refine command
 
 #### Candidate host set
 
@@ -592,6 +620,7 @@ Inputs:
 - `--out`
 - `--method`
 - `--seed`
+- `--threads`
 - `--bam` kept only for compatibility
 
 Current active clustering method:
@@ -611,12 +640,15 @@ Inputs:
 - `--contacts`
 - `--coverage-tsv`
 - `--out`
-- `--threads`
-- `--seed`
 
 Current implementation path:
 
 - `refine_bins_parquet(...)`
+
+Current main-path control semantics:
+
+- current CLI refine does not expose `seed` or `threads`
+- the active parquet refine path does not currently consume those controls
 
 ### `porebin export`
 
@@ -629,7 +661,11 @@ Inputs:
 - `--contigs`
 - `--bins-tsv`
 - `--out`
-- `--threads`
+
+Current main-path control semantics:
+
+- current CLI export does not expose `threads`
+- the active export path is currently single-threaded
 
 ### `porebin run-bam`
 
@@ -640,6 +676,12 @@ Function:
 Default mode:
 
 - `bam2contacts -> build -> cluster(spectral) -> refine -> export later by user`
+
+Current main-path control semantics:
+
+- `--seed` is a top-level reproducibility control for coarse clustering (and for baseline Leiden when `--pairwise-baseline` is used)
+- `--threads` is a top-level resource control for coarse clustering (and for baseline sort/reduce when `--pairwise-baseline` is used)
+- these top-level controls are not separate knobs for the current parquet refine stage
 
 Baseline mode:
 
@@ -964,6 +1006,10 @@ GMM / reassignment helpers:
 Parquet split path:
 
 - `_split_bins_parquet(...)`
+
+Note:
+
+- `_split_bins_parquet(...)` is currently an auxiliary/helper path and is not invoked by the current CLI parquet refine command
 
 Legacy refine helpers:
 

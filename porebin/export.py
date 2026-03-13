@@ -35,7 +35,6 @@ def export_bins(
     contigs_fasta: Path,
     bins_tsv: Path,
     out_dir: Path,
-    threads: int = 1,
     logger: Optional[logging.Logger] = None,
 ) -> ExportStats:
     """
@@ -184,7 +183,6 @@ def export_bins(
             "contigs_fasta": str(contigs_fasta),
             "bins_tsv": str(bins_tsv),
         },
-        "threads": threads,
     }
     write_json(out_dir / "export_meta.json", meta)
 

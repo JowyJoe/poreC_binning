@@ -470,8 +470,6 @@ def refine_bins_parquet(
     bins_tsv: Path,
     coverage_tsv: Optional[Path],
     out_dir: Path,
-    threads: int = 1,
-    seed: int = 0,
     logger: Optional[logging.Logger] = None,
 ) -> Path:
     """
@@ -520,8 +518,6 @@ def refine_bins_parquet(
             "bins_tsv": str(bins_tsv),
             "coverage_tsv": str(coverage_tsv) if coverage_tsv is not None else None,
         },
-        "seed": seed,
-        "threads": threads,
         "thresholds": {},
         "decisions": {},
         "stats": {},

@@ -39,6 +39,51 @@ def test_cli_help_smoke() -> None:
     assert "run-bam" in result.stdout
 
 
+def test_cluster_cli_threads_passthrough(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import porebin.cli as cli_mod
+
+    runner = CliRunner()
+    graph_dir = tmp_path / "graph"
+    graph_dir.mkdir()
+    out_dir = tmp_path / "out"
+    seen: dict[str, object] = {}
+
+    def fake_cluster_spectral_hypergraph(*, graph_dir, out_bins_tsv, seed, bam, threads):
+        seen["graph_dir"] = graph_dir
+        seen["out_bins_tsv"] = out_bins_tsv
+        seen["seed"] = seed
+        seen["bam"] = bam
+        seen["threads"] = threads
+        return {"method": "fake"}
+
+    monkeypatch.setattr(cli_mod, "cluster_spectral_hypergraph", fake_cluster_spectral_hypergraph)
+    result = runner.invoke(
+        cli_mod.app,
+        ["cluster", "--graph", str(graph_dir), "--out", str(out_dir), "--seed", "7", "--threads", "4"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["graph_dir"] == graph_dir
+    assert seen["seed"] == 7
+    assert seen["threads"] == 4
+    assert seen["bam"] is None
+
+
+def test_refine_and_export_help_hide_inactive_seed_threads() -> None:
+    from porebin.cli import app
+
+    runner = CliRunner()
+
+    refine_help = runner.invoke(app, ["refine", "--help"])
+    assert refine_help.exit_code == 0
+    assert "--seed" not in refine_help.stdout
+    assert "--threads" not in refine_help.stdout
+
+    export_help = runner.invoke(app, ["export", "--help"])
+    assert export_help.exit_code == 0
+    assert "--threads" not in export_help.stdout
+
+
 def test_build_pairwise_edges_from_bam(tmp_path: Path) -> None:
     pysam = pytest.importorskip("pysam", reason="pairwise BAM baseline optional dependency not installed")
 

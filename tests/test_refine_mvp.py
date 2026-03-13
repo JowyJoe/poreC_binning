@@ -86,8 +86,6 @@ def test_refine_mvp_outputs_and_core_only_bins(tmp_path: Path) -> None:
         bins_tsv=bins_tsv,
         coverage_tsv=None,
         out_dir=out_dir,
-        threads=1,
-        seed=0,
     )
     assert refined_bins.name == "bins.refined.tsv"
 
@@ -249,8 +247,6 @@ def test_refine_soft_gating_keeps_weak_bin_as_candidate_host(tmp_path: Path) -> 
         bins_tsv=bins_tsv,
         coverage_tsv=None,
         out_dir=out_dir,
-        threads=1,
-        seed=0,
     )
 
     scores_lines = (out_dir / "contig_host_scores.tsv").read_text(encoding="utf-8").splitlines()
