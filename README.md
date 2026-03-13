@@ -12,7 +12,7 @@ Core idea:
 ## Install
 
 ```bash
-pip install -e .
+pip install -e ".[bam,spectral]"
 ```
 
 Key dependencies:
@@ -28,6 +28,9 @@ conda env create -f environment.yml
 conda activate porebin
 pip install -e . --no-deps
 ```
+
+If you use the Conda environment for the main spectral pipeline, `scikit-learn` and `hdbscan`
+must also be present. The checked-in `environment.yml` now includes them.
 
 ## Documentation
 

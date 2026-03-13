@@ -10,7 +10,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-from porebin.utils import dedupe_preserve_order, ensure_dir
+from porebin.utils import dedupe_preserve_order, ensure_dir, iter_fasta_names
 
 
 class PairwiseBaselineError(RuntimeError):
@@ -27,6 +27,22 @@ class PairwiseBuildStats:
     unique_edges: int = 0
     input_sorted_by_readid: bool = True
     input_sorted_by_readid_verified: bool = True
+
+    @property
+    def alignments_total(self) -> int:
+        return int(self.segments_total)
+
+    @property
+    def alignments_kept(self) -> int:
+        return int(self.segments_kept)
+
+    @property
+    def input_sorted_by_qname(self) -> bool:
+        return bool(self.input_sorted_by_readid)
+
+    @property
+    def input_sorted_by_qname_verified(self) -> bool:
+        return bool(self.input_sorted_by_readid_verified)
 
 
 def parse_contacts_stream(contacts_path: Path) -> Iterator[tuple[str, str, str]]:
@@ -369,6 +385,166 @@ def build_pairwise_edges(
     )
     stats.unique_edges = external_sort_and_reduce(
         raw_parts,
+        out_edges_path=out_edges_path,
+        tmp_dir=tmp_dir,
+        sort_threads=sort_threads,
+        memory=memory,
+        logger=logger,
+    )
+    return stats
+
+
+def build_pairwise_edges_from_bam(
+    *,
+    bam: Path,
+    contigs_fasta: Path,
+    out_edges_path: Path,
+    tmp_dir: Path,
+    sort_threads: int = 1,
+    memory: Optional[str] = None,
+    chunk_lines: int = 5_000_000,
+    logger: Optional[logging.Logger] = None,
+) -> PairwiseBuildStats:
+    """
+    Build pairwise baseline edges directly from a queryname-sorted BAM.
+
+    This mirrors the BAM grouping rules used by the main hypergraph pipeline:
+      - one QNAME == one read group
+      - keep primary + supplementary alignments
+      - drop unmapped + secondary alignments
+      - deduplicate contigs within a read before clique expansion
+    """
+    logger = logger or logging.getLogger("porebin")
+    if not bam.exists():
+        raise FileNotFoundError(f"BAM not found: {bam}")
+    if not contigs_fasta.exists():
+        raise FileNotFoundError(f"Contigs FASTA not found: {contigs_fasta}")
+
+    try:
+        import pysam
+    except Exception as exc:  # pragma: no cover
+        raise PairwiseBaselineError(
+            "Pairwise BAM baseline requires 'pysam'. Install it (pip install 'porebin[bam]' or conda install pysam)."
+        ) from exc
+
+    fasta_contigs = {name for name in iter_fasta_names(contigs_fasta) if name}
+    if not fasta_contigs:
+        raise PairwiseBaselineError(f"No contigs found in FASTA: {contigs_fasta}")
+
+    ensure_dir(tmp_dir)
+    for old in tmp_dir.glob("raw.part*.tsv*"):
+        old.unlink(missing_ok=True)
+
+    stats = PairwiseBuildStats()
+    part_paths: list[Path] = []
+    part_idx = 0
+    lines_in_part = 0
+    out_fh = None
+
+    def open_part() -> None:
+        nonlocal out_fh, part_idx, lines_in_part
+        if out_fh is not None:
+            out_fh.close()
+        path = tmp_dir / f"raw.part{part_idx:03d}.tsv"
+        part_paths.append(path)
+        out_fh = open(path, "wt", encoding="utf-8", newline="")
+        part_idx += 1
+        lines_in_part = 0
+
+    def write_raw(a: str, b: str, w: float) -> None:
+        nonlocal lines_in_part
+        assert out_fh is not None
+        out_fh.write(f"{a}\t{b}\t{w:.10g}\n")
+        stats.raw_pairs_written += 1
+        lines_in_part += 1
+        if chunk_lines > 0 and lines_in_part >= int(chunk_lines):
+            open_part()
+
+    def flush_current(contigs: list[str]) -> None:
+        unique = dedupe_preserve_order([c for c in contigs if c])
+        k = len(unique)
+        if k < 2:
+            stats.reads_skipped_k_lt_2 += 1
+            return
+        w = 2.0 / (k * (k - 1))
+        for u, v in combinations(unique, 2):
+            if u == v:
+                continue
+            a, b = (u, v) if u < v else (v, u)
+            write_raw(a, b, w)
+
+    open_part()
+
+    bam_fh = pysam.AlignmentFile(str(bam), "rb")
+    try:
+        header_sort = (bam_fh.header.to_dict().get("HD") or {}).get("SO")
+        header_sort_norm = str(header_sort).lower() if header_sort is not None else None
+        enforce_lex_monotone = header_sort_norm not in {"queryname", "unknown"}
+        stats.input_sorted_by_readid_verified = bool(enforce_lex_monotone)
+        if header_sort_norm not in {None, "queryname", "unknown"}:
+            logger.warning(
+                "BAM header sort order is %r (expected 'queryname'). Pairwise baseline expects queryname-grouped BAM.",
+                header_sort,
+            )
+
+        current_qname: Optional[str] = None
+        current_contigs: list[str] = []
+        prev_qname: Optional[str] = None
+
+        for aln in bam_fh.fetch(until_eof=True):
+            stats.segments_total += 1
+
+            flag = int(getattr(aln, "flag", 0) or 0)
+            is_unmapped = bool(getattr(aln, "is_unmapped", False)) or ((flag & 0x4) != 0)
+            if is_unmapped:
+                continue
+            is_secondary = bool(getattr(aln, "is_secondary", False)) or ((flag & 0x100) != 0)
+            if is_secondary:
+                continue
+
+            qname = getattr(aln, "query_name", None)
+            if not qname:
+                continue
+
+            if enforce_lex_monotone:
+                if prev_qname is not None and qname < prev_qname:
+                    stats.input_sorted_by_readid = False
+                    raise PairwiseBaselineError(
+                        "BAM must be queryname-grouped (samtools sort -n) for pairwise baseline.\n"
+                        f"Detected non-monotonic QNAME (lex order): {qname!r} < {prev_qname!r}."
+                    )
+                prev_qname = qname
+
+            if current_qname is None:
+                current_qname = qname
+                stats.reads_total += 1
+            elif qname != current_qname:
+                flush_current(current_contigs)
+                current_qname = qname
+                current_contigs = []
+                stats.reads_total += 1
+
+            ref = getattr(aln, "reference_name", None)
+            if not ref or ref not in fasta_contigs:
+                continue
+
+            stats.segments_kept += 1
+            current_contigs.append(str(ref))
+
+        if current_qname is not None:
+            flush_current(current_contigs)
+    finally:
+        bam_fh.close()
+        if out_fh is not None:
+            out_fh.close()
+
+    if stats.reads_total == 0:
+        raise PairwiseBaselineError("No reads found in BAM input.")
+    if stats.raw_pairs_written == 0:
+        raise PairwiseBaselineError("No raw pairs written from BAM (all reads had k<2 after filtering).")
+
+    stats.unique_edges = external_sort_and_reduce(
+        part_paths,
         out_edges_path=out_edges_path,
         tmp_dir=tmp_dir,
         sort_threads=sort_threads,
