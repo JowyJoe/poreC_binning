@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from porebin.contact_hypergraph import ContactHypergraphError, iter_canonical_contact_rows
 from porebin.utils import iter_fasta_records
 from porebin.tnf_constants import CANON_TO_IDX, TNF136_LIST, build_idx256_to_idx136, canonical_4mer
 
@@ -225,8 +226,8 @@ def build_contact_incidence_from_parquet(
 
     Definitions (must match spec):
       - Hc[v,e] = P_{e,v}  (soft incidence from contig_weights)
-      - Drop contacts with k<2, count dropped_edges_singleton_contact
-      - Wc[e] = q(e) / (k - 1), where q(e) is contacts.parquet.weight
+      - Drop contacts with k_valid<2, count dropped_edges_singleton_contact
+      - Wc[e] = q(e) / (k_valid - 1), where q(e) is contacts.parquet.weight
       - Dec[e] = sum_v Hc[v,e]
       - Dvc[v] = sum_e Wc[e] * Hc[v,e]
     """
@@ -237,7 +238,6 @@ def build_contact_incidence_from_parquet(
 
     try:
         import numpy as np
-        import pyarrow.parquet as pq
         import scipy.sparse as sp
     except Exception as exc:  # pragma: no cover
         raise JointSpectralError(
@@ -253,46 +253,28 @@ def build_contact_incidence_from_parquet(
     W: list[float] = []
     De: list[float] = []
 
-    parquet = pq.ParquetFile(contacts_path)
-    schema = parquet.schema_arrow
-    cols_present = set(schema.names)
-    for req in ("contigs", "contig_weights", "k", "weight"):
-        if req not in cols_present:
-            raise JointSpectralError(f"contacts.parquet missing required column {req!r}. Found: {schema.names}")
-
     edge_idx = 0
     logger.info("JointSpectral: reading contacts.parquet: %s", contacts_path)
-    for batch in parquet.iter_batches(batch_size=int(parquet_batch_size), columns=["contigs", "contig_weights", "k", "weight"]):
-        b = batch.to_pydict()
-        contigs_list = b["contigs"]
-        weights_list = b["contig_weights"]
-        k_list = b["k"]
-        q_list = b["weight"]
-        n = len(contigs_list)
-        for i in range(n):
-            contigs_raw = contigs_list[i] or []
-            p_raw = weights_list[i] or []
-            k = int(k_list[i]) if k_list[i] is not None else len(contigs_raw)
-            if k < 2:
+    try:
+        for row in iter_canonical_contact_rows(
+            contacts_path,
+            parquet_batch_size=int(parquet_batch_size),
+            require_contig_weights=True,
+        ):
+            if row.k_valid < 2:
                 dropped += 1
                 continue
-            if not isinstance(contigs_raw, list) or not isinstance(p_raw, list) or len(contigs_raw) != len(p_raw):
-                continue
 
-            q = float(q_list[i]) if q_list[i] is not None else 1.0
-            Wc = float(q) / float(k - 1)
+            if row.contig_weights is None:
+                raise JointSpectralError("Internal error: canonical contact row is missing contig_weights.")
+
+            Wc = float(row.weight) / float(row.k_valid - 1)
             # accumulate Hc entries for this edge
             dec = 0.0
-            for c, p in zip(contigs_raw, p_raw, strict=True):
-                name = str(c)
-                if not name:
-                    continue
+            for name, pv in zip(row.contigs, row.contig_weights, strict=True):
                 idx = contig_name_to_idx.get(name)
                 if idx is None:
                     raise JointSpectralError(f"Contig {name!r} in contacts.parquet not found in contigs.tsv mapping.")
-                pv = float(p)
-                if pv <= 0.0:
-                    continue
                 rows.append(int(idx))
                 cols.append(int(edge_idx))
                 data.append(float(pv))
@@ -304,10 +286,12 @@ def build_contact_incidence_from_parquet(
             W.append(float(Wc))
             De.append(float(dec))
             edge_idx += 1
+    except ContactHypergraphError as exc:
+        raise JointSpectralError(str(exc)) from exc
 
     E = len(W)
     if E == 0:
-        raise JointSpectralError("No usable contact hyperedges (k>=2) in contacts.parquet.")
+        raise JointSpectralError("No usable contact hyperedges (k_valid>=2) in contacts.parquet.")
 
     H = sp.coo_matrix((np.asarray(data, dtype=float), (np.asarray(rows, dtype=int), np.asarray(cols, dtype=int))), shape=(V, E)).tocsr()
     W_arr = np.asarray(W, dtype=float)

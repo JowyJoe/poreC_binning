@@ -12,6 +12,7 @@ from typing import Any, Iterable, Optional
 
 from porebin import __version__
 from porebin.build_graph import order_norm
+from porebin.contact_hypergraph import ContactHypergraphError, iter_canonical_contact_rows
 from porebin.export import MIN_BIN_BP
 from porebin.utils import (
     dedupe_preserve_order,
@@ -49,6 +50,136 @@ class RefineStats:
     split_applied: int = 0
 
 
+@dataclass(frozen=True)
+class PreCleanupResult:
+    cleaned_assignment: dict[str, str]
+    anchor_mask: dict[str, bool]
+    anchor_weight: dict[str, float]
+    bin_status: dict[str, str]
+    bin_weight: dict[str, float]
+    anchor_count: dict[str, int]
+
+
+def pre_refine_cleanup(
+    *,
+    contacts_parquet: Path,
+    bins_tsv: Path,
+    contigs_fasta: Path,
+    coverage_tsv: Optional[Path],
+    out_dir: Path,
+) -> PreCleanupResult:
+    """
+    Minimal pre-refine cleanup for parquet path (v1):
+      - build contig_to_bin/bin_to_contigs from bins.tsv (exclude -1)
+      - compute contig_len + min_contig_len
+      - scan contacts.parquet support/affinity
+      - decontam to remove low-intra-support contigs
+      - derive anchor_mask + bin_status (strong/weak/impure)
+    """
+    contig_len = _read_contig_lengths(contigs_fasta)
+    min_contig_len, _meta = auto_min_contig_len(contig_len)
+
+    coarse_raw = _read_bins_tsv(bins_tsv)
+    contig_to_bin: dict[str, str] = {}
+    bin_to_contigs: dict[str, list[str]] = defaultdict(list)
+    bin_counts: dict[str, int] = defaultdict(int)
+    for c, b in coarse_raw.items():
+        c = str(c).strip()
+        b = str(b).strip()
+        if not c or c not in contig_len:
+            continue
+        if not b or b == "-1":
+            continue
+        contig_to_bin[c] = b
+        bin_to_contigs[b].append(c)
+        bin_counts[b] += 1
+
+    cov: Optional[dict[str, float]] = None
+    bin_cov_stats: Optional[dict[str, dict[str, float]]] = None
+    if coverage_tsv is not None and coverage_tsv.exists():
+        cov = _coverage_from_tsv(coverage_tsv, contig_len=contig_len, min_contig_len=min_contig_len)
+        bin_cov_stats = _bin_coverage_stats(bin_to_contigs, cov)
+
+    intra, other, _affinity, _meta2 = _scan_contacts_support_and_affinity_parquet(
+        contacts_parquet=contacts_parquet,
+        contig_len=contig_len,
+        min_contig_len=min_contig_len,
+        contig_to_bin=contig_to_bin,
+    )
+
+    out_dir = out_dir.resolve()
+    ensure_dir(out_dir)
+    decontam_path = out_dir / "pre_refine_decontam.tsv"
+    removed = _decontam(
+        bin_to_contigs=bin_to_contigs,
+        contig_len=contig_len,
+        contig_to_bin=contig_to_bin,
+        intra_support=intra,
+        other_support=other,
+        cov=cov,
+        bin_cov_stats=bin_cov_stats,
+        out_path=decontam_path,
+    )
+
+    # Anchor rule (v1): kept in cleaned_assignment, length ok, intra >= bin median, intra > other
+    anchor_mask: dict[str, bool] = {c: False for c in contig_len.keys()}
+    anchor_weight: dict[str, float] = {c: 0.0 for c in contig_len.keys()}
+    anchor_count: dict[str, int] = defaultdict(int)
+    bin_intra_median: dict[str, float] = {}
+    for bin_id, contigs in bin_to_contigs.items():
+        vals = [float(intra.get(c, 0.0)) for c in contigs]
+        if not vals:
+            continue
+        med = _median(vals)
+        bin_intra_median[bin_id] = float(med)
+        for c in contigs:
+            if contig_len.get(c, 0) < min_contig_len:
+                continue
+            if float(intra.get(c, 0.0)) < float(med):
+                continue
+            if float(intra.get(c, 0.0)) <= float(other.get(c, 0.0)):
+                continue
+            anchor_mask[c] = True
+            anchor_count[bin_id] += 1
+
+    # Bin status (engineering gating)
+    bin_status: dict[str, str] = {}
+    bin_weight: dict[str, float] = {}
+    bin_bp, _ = _bin_sizes_from_assignment(contig_to_bin, contig_len)
+    for bin_id, contigs in bin_to_contigs.items():
+        removed_in_bin = 0
+        orig_n = int(bin_counts.get(bin_id, 0))
+        if orig_n > 0:
+            removed_in_bin = sum(1 for c in removed if coarse_raw.get(c) == bin_id)
+        removed_ratio = (removed_in_bin / orig_n) if orig_n > 0 else 0.0
+        if removed_ratio > 0.3:
+            bin_status[bin_id] = "impure"
+        elif int(anchor_count.get(bin_id, 0)) >= 2:
+            bin_status[bin_id] = "strong"
+        else:
+            bin_status[bin_id] = "weak"
+        bin_weight[bin_id] = _bin_weight_from_status(bin_status[bin_id])
+
+    for bin_id, contigs in bin_to_contigs.items():
+        bin_med = float(bin_intra_median.get(bin_id, 0.0))
+        for c in contigs:
+            anchor_weight[c] = _anchor_weight_from_support(
+                intra_support=float(intra.get(c, 0.0)),
+                other_support=float(other.get(c, 0.0)),
+                bin_median_support=bin_med,
+                is_anchor=bool(anchor_mask.get(c, False)),
+            )
+
+    return PreCleanupResult(
+        cleaned_assignment=contig_to_bin,
+        anchor_mask=anchor_mask,
+        anchor_weight=anchor_weight,
+        bin_status=bin_status,
+        bin_weight=bin_weight,
+        anchor_count=dict(anchor_count),
+    )
+
+
 def _entropy(probs: list[float]) -> float:
     """Natural entropy (nats)."""
     h = 0.0
@@ -62,6 +193,44 @@ def _entropy(probs: list[float]) -> float:
 def _effective_hosts(entropy_nats: float) -> float:
     """Effective support count: exp(entropy)."""
     return float(math.exp(float(entropy_nats)))
+
+
+def _clip01(x: float) -> float:
+    return float(max(0.0, min(1.0, float(x))))
+
+
+def _bin_weight_from_status(status: str) -> float:
+    if status == "strong":
+        return 1.0
+    if status == "weak":
+        return 0.35
+    return 0.0
+
+
+def _anchor_weight_from_support(
+    *,
+    intra_support: float,
+    other_support: float,
+    bin_median_support: float,
+    is_anchor: bool,
+    eps: float = 1e-12,
+) -> float:
+    intra_support = max(0.0, float(intra_support))
+    other_support = max(0.0, float(other_support))
+    bin_median_support = max(0.0, float(bin_median_support))
+
+    purity = max(0.0, intra_support - other_support) / (intra_support + other_support + eps)
+    if intra_support <= 0.0:
+        strength = 0.0
+    elif bin_median_support <= 0.0:
+        strength = 1.0
+    else:
+        strength = min(1.0, intra_support / (bin_median_support + eps))
+
+    weight = purity * math.sqrt(max(0.0, strength))
+    if is_anchor:
+        weight = max(weight, 0.85)
+    return _clip01(weight)
 
 
 def refine_bins(
@@ -372,32 +541,27 @@ def refine_bins_parquet(
         stats.contigs_total = len(contig_len)
 
         coarse_raw = _read_bins_tsv(bins_tsv)
-        coarse_filtered: dict[str, str] = {}
-        for c, b in coarse_raw.items():
-            c = str(c).strip()
-            b = str(b).strip()
-            if not c:
-                continue
-            if c not in contig_len:
-                continue
-            coarse_filtered[c] = b
+        cleanup = pre_refine_cleanup(
+            contacts_parquet=contacts_parquet,
+            bins_tsv=bins_tsv,
+            contigs_fasta=contigs_fasta,
+            coverage_tsv=coverage_tsv,
+            out_dir=out_dir,
+        )
 
-        # Candidate host bins set B (exclude -1).
-        B: list[str] = sorted({b for b in coarse_filtered.values() if b and b != "-1"})
+        # Candidate host bins set B (exclude impure bins; strong bins dominate via higher bin_weight).
+        B: list[str] = sorted({b for b, w in cleanup.bin_weight.items() if float(w) > 0.0})
         B_set = set(B)
-        if not B:
-            raise RefineError("No candidate host bins found in coarse bins.tsv (empty or only -1).")
-
         stats.bins_total = int(len(B))
         stats.bins_kept_initial = int(stats.bins_total)
 
-        # Coarse label per contig in the FASTA; use "-1" for unassigned/noise.
+        # Coarse label per contig in the FASTA; use cleaned_assignment for scoring.
         contig_to_coarse: dict[str, str] = {}
         assigned = 0
         for c in contig_len.keys():
-            b = coarse_filtered.get(c, "-1")
+            b = cleanup.cleaned_assignment.get(c, "-1")
             b = str(b).strip() if b is not None else "-1"
-            if b not in B_set:
+            if b not in B_set or float(cleanup.bin_weight.get(b, 0.0)) <= 0.0:
                 b = "-1"
             else:
                 assigned += 1
@@ -416,8 +580,6 @@ def refine_bins_parquet(
             if not contigs_raw or not pi_raw:
                 continue
 
-            # Merge duplicates and renormalize pi.
-            seen: dict[str, int] = {}
             contigs: list[str] = []
             pi: list[float] = []
             for c, w in zip(contigs_raw, pi_raw, strict=True):
@@ -429,12 +591,8 @@ def refine_bins_parquet(
                 ww = float(w)
                 if ww <= 0.0:
                     continue
-                if c in seen:
-                    pi[seen[c]] += ww
-                else:
-                    seen[c] = len(contigs)
-                    contigs.append(c)
-                    pi.append(ww)
+                contigs.append(c)
+                pi.append(ww)
 
             if len(contigs) < 2:
                 reads_skipped_k_lt_2 += 1
@@ -448,26 +606,36 @@ def refine_bins_parquet(
             reads_used += 1
             q_read = float(q)
 
-            # Bin mass per candidate host: M_r(b) = sum_{u in bin b} pi_{r,u}
+            # Soft-gated bin mass per candidate host:
+            #   M_r(b) = sum_{u in bin b} bin_weight(b) * anchor_weight(u) * pi_{r,u}
             m_by_host: dict[str, float] = {}
             host_of: list[str] = []
+            self_mass_of: list[float] = []
             for c, pc in zip(contigs, pi, strict=True):
                 b = contig_to_coarse.get(c, "-1")
                 host_of.append(b)
+                anchor_w = float(cleanup.anchor_weight.get(c, 0.0))
+                bin_w = float(cleanup.bin_weight.get(b, 0.0)) if b != "-1" else 0.0
+                self_mass = bin_w * anchor_w * float(pc)
+                self_mass_of.append(self_mass)
                 if b == "-1":
                     continue
-                m_by_host[b] = m_by_host.get(b, 0.0) + float(pc)
+                if bin_w <= 0.0:
+                    continue
+                if anchor_w <= 0.0:
+                    continue
+                m_by_host[b] = m_by_host.get(b, 0.0) + float(self_mass)
 
             if not m_by_host:
                 continue
 
-            # MVP v1 support update (strict definition):
+            # Soft-gated support update:
             #   support[c][b] += q(r) * pi_{r,c} * max(0, M_r(b) - self_term)
             # where:
-            #   M_r(b) = sum_{u in bin b} pi_{r,u}
-            #   self_term = pi_{r,c} if coarse_bin(c) == b else 0
+            #   M_r(b) = sum_{u in bin b} bin_weight(b) * anchor_weight(u) * pi_{r,u}
+            #   self_term = bin_weight(b) * anchor_weight(c) * pi_{r,c} if coarse_bin(c) == b else 0
             # High-order read philosophy: eta(k)=1.0 (no extra k penalty in refine).
-            for c, pc, b_c in zip(contigs, pi, host_of, strict=True):
+            for c, pc, b_c, self_mass in zip(contigs, pi, host_of, self_mass_of, strict=True):
                 pc = float(pc)
                 if pc <= 0.0:
                     continue
@@ -478,7 +646,7 @@ def refine_bins_parquet(
                 for b, m in m_by_host.items():
                     m_eff = float(m)
                     if b_c == b:
-                        m_eff = max(0.0, m_eff - pc)
+                        m_eff = max(0.0, m_eff - float(self_mass))
                     if m_eff <= 0.0:
                         continue
                     d[b] = float(d.get(b, 0.0)) + q_read * pc * m_eff
@@ -516,7 +684,7 @@ def refine_bins_parquet(
         ) as fh_scores, assoc_path.open("w", encoding="utf-8", newline="") as fh_assoc:
             fh_bins.write("contig_name\tbin_id\n")
             fh_scores.write(
-                "contig_name\tcoarse_host\ttop1_host\ttop2_host\t"
+                "contig_name\tcoarse_host\tbin_status\ttop1_host\ttop2_host\t"
                 "top1_score\ttop2_score\tmargin\tentropy\teffective_hosts\t"
                 "has_contact_support\tis_core_like\tis_ambiguous\tis_accessory_candidate\n"
             )
@@ -526,13 +694,15 @@ def refine_bins_parquet(
             )
 
             for c in contigs_all:
-                coarse_host = contig_to_coarse.get(c, "-1")
+                coarse_host = str(coarse_raw.get(c, "-1")).strip() if c in coarse_raw else "-1"
+                bin_status = cleanup.bin_status.get(coarse_host, "none")
                 sdict = support.get(c, {})
 
                 # MVP prior: weak coarse-label regularizer (indicator on coarse_host), not a direct feature prior.
                 sum_support = float(sum(float(v) for v in sdict.values()))
                 has_contact_support = bool(sum_support > 0.0)
-                alpha_c = float(prior_strength * (sum_support + eps))
+                coarse_bin_weight = float(cleanup.bin_weight.get(coarse_host, 0.0)) if coarse_host != "-1" else 0.0
+                alpha_c = float(prior_strength * coarse_bin_weight * (sum_support + eps))
 
                 # If a contig has no contact support and has no coarse prior (coarse_host == -1),
                 # treat it as unresolved-no-contact rather than accessory-like.
@@ -548,7 +718,27 @@ def refine_bins_parquet(
                     is_accessory = False
                     is_ambiguous = True
                     fh_scores.write(
-                        f"{c}\t{coarse_host}\t{top1_host}\t{top2_host}\t"
+                        f"{c}\t{coarse_host}\t{bin_status}\t{top1_host}\t{top2_host}\t"
+                        f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
+                        f"{1 if has_contact_support else 0}\t"
+                        f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
+                    )
+                    n_ambiguous += 1
+                    continue
+
+                if B_count == 0:
+                    top1_host = "-1"
+                    top2_host = "-1"
+                    top1_score = 0.0
+                    top2_score = 0.0
+                    margin = 0.0
+                    ent = 0.0
+                    effective_hosts = 0.0
+                    is_core_like = False
+                    is_accessory = False
+                    is_ambiguous = True
+                    fh_scores.write(
+                        f"{c}\t{coarse_host}\t{bin_status}\t{top1_host}\t{top2_host}\t"
                         f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
                         f"{1 if has_contact_support else 0}\t"
                         f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
@@ -582,12 +772,31 @@ def refine_bins_parquet(
                 if not ranked:
                     ranked = B[:3]
 
-                top1_host = ranked[0]
-                top2_host = ranked[1] if B_count >= 2 else ""
-
-                top1_score = theta_of(top1_host)
-                top2_score = theta_of(top2_host) if top2_host else 0.0
-                margin = float(top1_score - top2_score)
+                if not ranked or not score_nz:
+                    top1_host = "-1"
+                    top2_host = "-1"
+                    top1_score = 0.0
+                    top2_score = 0.0
+                    margin = 0.0
+                    ent = 0.0
+                    effective_hosts = 0.0
+                    is_core_like = False
+                    is_accessory = False
+                    is_ambiguous = True
+                    fh_scores.write(
+                        f"{c}\t{coarse_host}\t{bin_status}\t{top1_host}\t{top2_host}\t"
+                        f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
+                        f"{1 if has_contact_support else 0}\t"
+                        f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
+                    )
+                    n_ambiguous += 1
+                    continue
+                else:
+                    top1_host = ranked[0]
+                    top2_host = ranked[1] if B_count >= 2 else ""
+                    top1_score = theta_of(top1_host)
+                    top2_score = theta_of(top2_host) if top2_host else 0.0
+                    margin = float(top1_score - top2_score)
 
                 # entropy = -sum_b theta[c][b] * log(theta[c][b] + eps)
                 theta0 = float(eps / denom)
@@ -611,7 +820,7 @@ def refine_bins_parquet(
                 )
                 is_ambiguous = bool(not is_core_like)
 
-                if is_core_like:
+                if is_core_like and float(cleanup.bin_weight.get(top1_host, 0.0)) > 0.0:
                     n_core += 1
                     final_bins_used.add(top1_host)
                     fh_bins.write(f"{c}\t{top1_host}\n")
@@ -621,7 +830,7 @@ def refine_bins_parquet(
                     n_ambiguous += 1
 
                 fh_scores.write(
-                    f"{c}\t{coarse_host}\t{top1_host}\t{top2_host}\t"
+                    f"{c}\t{coarse_host}\t{bin_status}\t{top1_host}\t{top2_host}\t"
                     f"{top1_score:.6g}\t{top2_score:.6g}\t{margin:.6g}\t{ent:.6g}\t{effective_hosts:.6g}\t"
                     f"{1 if has_contact_support else 0}\t"
                     f"{1 if is_core_like else 0}\t{1 if is_ambiguous else 0}\t{1 if is_accessory else 0}\n"
@@ -660,6 +869,7 @@ def refine_bins_parquet(
 
         record["thresholds"] = {
             "eps": eps,
+            "bin_weight_status_map": {"strong": 1.0, "weak": 0.35, "impure": 0.0},
             "core_like_thresholds": {
                 "top1_score_min": core_top1_score_thresh,
                 "margin_min": core_margin_thresh,
@@ -678,8 +888,25 @@ def refine_bins_parquet(
             "refine_method": "host_assignment_inference",
             "high_order_read_philosophy": "q_controls_total_information",
             "eta_k": 1.0,
+            "soft_gating_enabled": True,
+            "candidate_bin_rule": "non_impure_bins",
+            "bin_weight_scheme": {
+                "type": "status_piecewise_constant",
+                "strong": 1.0,
+                "weak": 0.35,
+                "impure": 0.0,
+            },
+            "anchor_weight_scheme": {
+                "type": "support_purity_times_sqrt_strength_with_anchor_floor",
+                "purity": "max(0, intra_support-other_support)/(intra_support+other_support+eps)",
+                "strength": "min(1, intra_support/(bin_median_support+eps))",
+                "anchor_floor_if_mask": 0.85,
+            },
+            "support_formula": "theta[c,b] += q(r) * pi[r,c] * max(0, M_r(b) - self_term)",
+            "support_host_mass_formula": "M_r(b) = sum_{u in b} bin_weight(b) * anchor_weight(u) * pi[r,u]",
             "coarse_prior_used": True,
             "coarse_prior_strength": prior_strength,
+            "coarse_prior_bin_weighted": True,
             "direct_feature_prior_used": False,
         }
         record["stats"] = {
@@ -986,39 +1213,14 @@ def _iter_contacts_parquet(
       - weight: float (q(r), read quality weight; default 1.0 if missing)
     """
     try:
-        import pyarrow.parquet as pq
-    except Exception as exc:  # pragma: no cover
-        raise RefineError(
-            "refine_parquet requires 'pyarrow' to read contacts.parquet. Install it, e.g. pip install pyarrow."
-        ) from exc
-
-    parquet = pq.ParquetFile(contacts_parquet)
-    schema = parquet.schema_arrow
-    cols = set(schema.names)
-    if "contigs" not in cols or "contig_weights" not in cols:
-        raise RefineError(
-            "contacts.parquet must contain columns: contigs, contig_weights. "
-            f"Found: {schema.names}"
-        )
-    has_weight = "weight" in cols
-    read_cols = ["contigs", "contig_weights"] + (["weight"] if has_weight else [])
-    for batch in parquet.iter_batches(batch_size=int(batch_size), columns=read_cols):
-        data = batch.to_pydict()
-        contigs_list = data["contigs"]
-        weights_list = data["contig_weights"]
-        w_list = data.get("weight")
-        n = len(contigs_list)
-        for i in range(n):
-            contigs_raw = contigs_list[i] or []
-            p_raw = weights_list[i] or []
-            if not isinstance(contigs_raw, list) or not isinstance(p_raw, list):
-                continue
-            if len(p_raw) != len(contigs_raw):
-                continue
-            contigs = [str(c) for c in contigs_raw]
-            p = [float(x) for x in p_raw]
-            w = float(w_list[i]) if w_list is not None and w_list[i] is not None else 1.0
-            yield contigs, p, w
+        for row in iter_canonical_contact_rows(
+            contacts_parquet,
+            parquet_batch_size=int(batch_size),
+            require_contig_weights=True,
+        ):
+            yield list(row.contigs), list(row.contig_weights or []), float(row.weight)
+    except ContactHypergraphError as exc:
+        raise RefineError(str(exc)) from exc
 
 
 def _scan_contacts_support_and_affinity_parquet(

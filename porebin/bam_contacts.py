@@ -26,6 +26,7 @@ class BamContactsStats:
     alignments_kept: int = 0
     alignments_skipped_unmapped: int = 0
     alignments_skipped_secondary: int = 0
+    alignments_supplementary_used: int = 0
     alignments_skipped_missing_ref: int = 0
     alignments_skipped_len_missing: int = 0
 

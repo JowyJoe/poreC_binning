@@ -1,8 +1,13 @@
-# porebin (v0.1)
+# porebin (v0.1.0)
 
 Host-centric, hypergraph-preserving metagenome binning from Nanopore Pore-C multi-way contacts.
 
-Core idea: treat each multi-way contact as a **hyperedge** (one read = one hyperedge), preserve it without clique expansion, and cluster contigs using the hypergraph signal.
+Core idea:
+
+- treat each multi-way contact as one hyperedge
+- preserve the hyperedge structure without clique expansion in the main method
+- combine contact hypergraph signal and feature hypergraph signal for coarse clustering
+- run a refine stage that performs host-assignment inference on top of coarse candidate host communities
 
 ## Install
 
@@ -10,12 +15,13 @@ Core idea: treat each multi-way contact as a **hyperedge** (one read = one hyper
 pip install -e .
 ```
 
-Dependencies (key ones): `pyarrow`, `python-igraph`, `leidenalg`, `typer`, `rich`.
-Optional (BAM input via `bam2contacts` / `run-bam`): `pysam`. Optional (spectral coarse clustering): `scipy`, `scikit-learn`, `hdbscan`.
+Key dependencies:
 
-### Install (conda, recommended on servers)
+- required: `pyarrow`, `python-igraph`, `leidenalg`, `typer`, `rich`
+- BAM path: `pysam`
+- spectral coarse clustering: `scipy`, `scikit-learn`, `hdbscan`
 
-Use the provided `environment.yml` to get a stable stack for `pyarrow/python-igraph/leidenalg`:
+### Conda install
 
 ```bash
 conda env create -f environment.yml
@@ -23,84 +29,73 @@ conda activate porebin
 pip install -e . --no-deps
 ```
 
-If you prefer not to use `environment.yml`:
+## Documentation
 
-```bash
-conda create -n porebin python=3.10 -y
-conda activate porebin
-conda install -c conda-forge -y pyarrow python-igraph leidenalg typer rich
-pip install -e . --no-deps
-```
+- Current architecture, math, interfaces, and legacy paths:
+  [`docs/PROJECT_REFERENCE.md`](docs/PROJECT_REFERENCE.md)
+- Short context/status note:
+  [`docs/CONTEXT.md`](docs/CONTEXT.md)
+
+`docs/PROJECT_REFERENCE.md` is the current source-of-truth document for repository structure and behavior.
 
 ## Commands
 
-- `porebin run-bam`: end-to-end BAM pipeline (recommended). Add `--pairwise-baseline` for the normal-graph control.
-- `porebin bam2contacts`: name-sorted BAM → `contacts.parquet` (+ `coverage.tsv`)
-- `porebin refine`: host-assignment inference on top of coarse candidate host communities (inputs: `contacts.parquet` + `bins.tsv`)
-- `porebin export`: export FASTA with built-in policy (keep bins ≥200kb; short contigs/tiny bins → `unbinned.fasta`)
-- Advanced: `porebin build`, `porebin cluster`, `porebin refine`
+- `porebin run-bam`: end-to-end BAM pipeline. Add `--pairwise-baseline` for the clique-expansion control.
+- `porebin bam2contacts`: convert a name-sorted BAM into `contacts.parquet` and `coverage.tsv`.
+- `porebin build`: write graph audit artifacts from `contacts.parquet`.
+- `porebin cluster`: run coarse clustering (`spectral` is the active method).
+- `porebin refine`: run host-assignment inference from `contacts.parquet` and coarse `bins.tsv`.
+- `porebin export`: export FASTA bins and `unbinned.fasta`.
 
-All commands write `out_dir/run.json` (parameters, time, version, seed). `porebin refine` additionally writes `out_dir/run_refine.json`.
+All commands write `out_dir/run.json`. `porebin refine` also writes `out_dir/run_refine.json`.
 
-## Typical workflow (no threshold parameters)
+## Recommended workflow
 
 ```bash
-# (Recommended) BAM pipeline: coarse + refine
-# upstream example: minimap2 ... | samtools sort -n -o reads.namesorted.bam
+# upstream example:
+# minimap2 ... | samtools sort -n -o reads.namesorted.bam
+
 porebin run-bam --bam reads.namesorted.bam --contigs contigs.fasta --out out_bam --seed 0
 porebin export --contigs contigs.fasta --bins-tsv out_bam/refined/bins.refined.tsv --out out_bam/final_bins
+```
 
-# Pairwise baseline (normal graph control)
+Pairwise baseline:
+
+```bash
 porebin run-bam --pairwise-baseline --bam reads.namesorted.bam --contigs contigs.fasta --out out_pw --seed 0
 porebin export --contigs contigs.fasta --bins-tsv out_pw/bins.tsv --out out_pw/final_bins
 ```
 
-## Experimental: hypergraph spectral coarse clustering
+## Input summary
 
-This branch provides an optional coarse clustering method:
-- `--method spectral` for `porebin cluster` (only supported method)
-- `--coarse-method spectral` (default; only supported method) for `porebin run-bam`
+### Name-sorted BAM
 
-Install optional deps:
-
-```bash
-pip install -e '.[spectral]'
-```
-
-Run:
-
-```bash
-porebin run-bam --coarse-method spectral --bam reads.namesorted.bam --contigs contigs.fasta --out out_bam_spectral --seed 0
-```
-
-## Input formats
-
-### Name-sorted BAM (for `porebin bam2contacts` / `porebin run-bam`)
-
-We treat each read (QNAME) as one hyperedge, so the BAM must be **queryname-sorted**:
+The main BAM path assumes one read name equals one hyperedge.
 
 ```bash
 samtools sort -n -o reads.namesorted.bam reads.bam
-samtools index reads.namesorted.bam  # optional
 ```
 
-This pipeline is designed for minimap2 + samtools, but works with any aligner that outputs standard BAM fields/tags.
+### contacts.parquet
 
-### Contacts Parquet (for `porebin build`)
+`contacts.parquet` is the evidence-layer source of truth in the current pipeline.
 
-`contacts.parquet` contains one row per contact/hyperedge:
-- required: `contact_id`, `contigs` (list[str]), `k`, `weight`, `support_count`
-- optional: `contig_weights` (normalized evidence shares \(\\pi_{r,c}\); sums to 1 over contigs touched by the read; not a posterior)
-- optional evidence: `mapq_min`, `mapq_mean`, `as_sum`, `n_segments`
+The detailed schema and semantics are documented in:
 
-## Pairwise baseline (for papers)
+- [`docs/PROJECT_REFERENCE.md`](docs/PROJECT_REFERENCE.md)
 
-`porebin run-bam --pairwise-baseline` builds a **pairwise normal graph** control via clique expansion, with fair per-read weights:
-- for each read with order `k`, each pair gets `w_pair = 2/(k*(k-1)) = 1/C(k,2)` so that all pairs from that read sum to 1.
+Important fields include:
 
-Run:
+- `contigs`
+- `contig_weights`
+- `k`
+- `k_eff`
+- `weight`
+- BAM/QC evidence columns
 
-```bash
-porebin run-bam --pairwise-baseline --bam reads.namesorted.bam --contigs contigs.fasta --out out_pw --seed 0
-```
+## Notes
 
+- Main coarse path: joint hypergraph spectral embedding + HDBSCAN
+- Main refine path: parquet-based host-assignment inference with soft gating
+- Pairwise baseline is a control path, not the main method
+- Historical and legacy paths still exist in the repository and are documented in `docs/PROJECT_REFERENCE.md`

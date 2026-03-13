@@ -85,3 +85,49 @@ def test_bam2contacts_keeps_supplementary_drops_secondary_skips_unmapped(tmp_pat
     assert qc["stats"]["unmapped_skipped"] == 1
     assert qc["stats"]["secondary_skipped"] == 1
     assert qc["stats"]["supplementary_used"] == 1
+
+
+def test_bam2contacts_without_supplementary_still_reports_zero(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow", reason="pyarrow required for contacts.parquet")
+    pysam = pytest.importorskip("pysam", reason="bam2contacts optional dependency not installed")
+
+    from porebin.cli import bam2contacts
+
+    contigs = tmp_path / "contigs.fasta"
+    _write_contigs(contigs)
+
+    bam = tmp_path / "reads.namesorted.bam"
+    header = {
+        "HD": {"VN": "1.6", "SO": "queryname"},
+        "SQ": [
+            {"SN": "contigA", "LN": 1000},
+            {"SN": "contigB", "LN": 1000},
+            {"SN": "contigC", "LN": 1000},
+        ],
+    }
+
+    def seg(*, qname: str, rname: str) -> "pysam.AlignedSegment":
+        a = pysam.AlignedSegment()
+        a.query_name = qname
+        a.query_sequence = "T" * 100
+        a.flag = 0
+        a.reference_id = {"contigA": 0, "contigB": 1, "contigC": 2}[rname]
+        a.reference_start = 0
+        a.mapping_quality = 10
+        a.cigarstring = "100M"
+        a.set_tag("NM", 0)
+        return a
+
+    with pysam.AlignmentFile(str(bam), "wb", header=header) as out:
+        out.write(seg(qname="read1", rname="contigA"))
+        out.write(seg(qname="read1", rname="contigB"))
+
+    out_dir = tmp_path / "out"
+    bam2contacts(bam=bam, contigs=contigs, out=out_dir, parquet_batch_size=10_000)
+
+    run = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
+    stats = run.get("stats") or {}
+    assert stats["alignments_supplementary_used"] == 0
+
+    qc = json.loads(Path(run["outputs"]["qc_json"]).read_text(encoding="utf-8"))
+    assert qc["stats"]["supplementary_used"] == 0

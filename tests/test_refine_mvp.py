@@ -25,15 +25,15 @@ def test_refine_mvp_outputs_and_core_only_bins(tmp_path: Path) -> None:
     # - X/Y are coarse -1 but have contact support (accessory-like association head).
     # - Z is coarse -1 with no contact support (unresolved_no_contact).
     contigs = [
-        ("A", "ACGT" * 50),
-        ("B", "ACGT" * 50),
-        ("C", "TGCA" * 50),
-        ("D", "TGCA" * 50),
-        ("E", "AAAA" * 50),
-        ("F", "TTTT" * 50),
-        ("X", "CCCC" * 50),
-        ("Y", "CCCC" * 50),
-        ("Z", "CCCC" * 50),
+        ("A", "ACGT" * 800),
+        ("B", "ACGT" * 800),
+        ("C", "TGCA" * 800),
+        ("D", "TGCA" * 800),
+        ("E", "AAAA" * 800),
+        ("F", "TTTT" * 800),
+        ("X", "CCCC" * 800),
+        ("Y", "CCCC" * 800),
+        ("Z", "CCCC" * 800),
     ]
     _write_fasta(contigs_fasta, contigs)
 
@@ -64,9 +64,9 @@ def test_refine_mvp_outputs_and_core_only_bins(tmp_path: Path) -> None:
             rows_pi.append(list(ws))
             rows_q.append(float(q))
 
-    add_read(["A", "B"], [0.5, 0.5], n=10)
-    add_read(["C", "D"], [0.5, 0.5], n=10)
-    add_read(["E", "F"], [0.5, 0.5], n=10)
+    add_read(["A", "B"], [0.5, 0.5], n=50)
+    add_read(["C", "D"], [0.5, 0.5], n=50)
+    add_read(["E", "F"], [0.5, 0.5], n=50)
     add_read(["X", "A", "C", "E"], [0.7, 0.1, 0.1, 0.1], n=10)
     # Y has contact support to exactly two candidate hosts (0 and 1), so top_hosts should be 2 (no zero-padding).
     add_read(["Y", "A", "C"], [0.8, 0.1, 0.1], n=10)
@@ -104,6 +104,7 @@ def test_refine_mvp_outputs_and_core_only_bins(tmp_path: Path) -> None:
     assert header == [
         "contig_name",
         "coarse_host",
+        "bin_status",
         "top1_host",
         "top2_host",
         "top1_score",
@@ -183,3 +184,88 @@ def test_refine_mvp_outputs_and_core_only_bins(tmp_path: Path) -> None:
     assert decisions["coarse_prior_used"] is True
     assert abs(float(decisions["coarse_prior_strength"]) - 0.05) < 1e-12
     assert decisions["direct_feature_prior_used"] is False
+
+
+def test_refine_soft_gating_keeps_weak_bin_as_candidate_host(tmp_path: Path) -> None:
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from porebin.refine import refine_bins_parquet
+
+    contigs_fasta = tmp_path / "contigs.fasta"
+    contacts_parquet = tmp_path / "contacts.parquet"
+    bins_tsv = tmp_path / "bins.tsv"
+    out_dir = tmp_path / "refined"
+
+    contigs = [
+        ("A", "ACGT" * 800),
+        ("B", "ACGT" * 800),
+        ("C", "TGCA" * 800),
+        ("D", "TGCA" * 800),
+        ("X", "CCCC" * 800),
+    ]
+    _write_fasta(contigs_fasta, contigs)
+
+    with bins_tsv.open("w", encoding="utf-8", newline="") as fh:
+        fh.write("contig_name\tbin_id\n")
+        fh.write("A\t0\n")
+        fh.write("B\t0\n")
+        fh.write("C\t1\n")
+        fh.write("D\t1\n")
+        fh.write("X\t-1\n")
+
+    rows_contigs: list[list[str]] = []
+    rows_pi: list[list[float]] = []
+    rows_q: list[float] = []
+
+    def add_read(cs: list[str], ws: list[float], q: float = 1.0, n: int = 1) -> None:
+        for _ in range(int(n)):
+            rows_contigs.append(list(cs))
+            rows_pi.append(list(ws))
+            rows_q.append(float(q))
+
+    # Bin 0 becomes strong through clean within-bin support.
+    add_read(["A", "B"], [0.5, 0.5], n=50)
+    # Bin 1 becomes weak: C and D have some within-bin support, but D is strongly cross-linked to bin 0.
+    add_read(["C", "D"], [0.5, 0.5], n=20)
+    add_read(["D", "A"], [0.5, 0.5], n=50)
+    # Unbinned X only links to C from the weak bin, so soft gating should still expose host 1.
+    add_read(["X", "C"], [0.8, 0.2], n=20)
+
+    table = pa.table(
+        {
+            "contigs": pa.array(rows_contigs, type=pa.list_(pa.string())),
+            "contig_weights": pa.array(rows_pi, type=pa.list_(pa.float64())),
+            "weight": pa.array(rows_q, type=pa.float64()),
+        }
+    )
+    pq.write_table(table, contacts_parquet)
+
+    refine_bins_parquet(
+        contigs_fasta=contigs_fasta,
+        contacts_parquet=contacts_parquet,
+        bins_tsv=bins_tsv,
+        coverage_tsv=None,
+        out_dir=out_dir,
+        threads=1,
+        seed=0,
+    )
+
+    scores_lines = (out_dir / "contig_host_scores.tsv").read_text(encoding="utf-8").splitlines()
+    header = scores_lines[0].split("\t")
+    by_contig: dict[str, dict[str, str]] = {}
+    for line in scores_lines[1:]:
+        row = line.split("\t")
+        by_contig[row[0]] = {header[i]: row[i] for i in range(len(header))}
+
+    assert by_contig["X"]["has_contact_support"] == "1"
+    assert by_contig["X"]["top1_host"] == "1"
+
+    run_refine = json.loads((out_dir / "run_refine.json").read_text(encoding="utf-8"))
+    assert run_refine["stats"]["candidate_bins_count"] == 2
+    decisions = run_refine["decisions"]
+    assert decisions["soft_gating_enabled"] is True
+    assert decisions["candidate_bin_rule"] == "non_impure_bins"
+    assert decisions["bin_weight_scheme"]["weak"] == 0.35

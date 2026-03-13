@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from porebin import __version__
+from porebin.contact_hypergraph import ContactHypergraphError, iter_canonical_contact_rows
 from porebin.utils import ensure_dir, iter_fasta_names
 
 
@@ -94,13 +95,6 @@ def build_graph(
     logger.info(f"Building graph from contacts: {contacts_parquet}")
     logger.info(f"Contigs in FASTA: {len(contig_names)}")
 
-    try:
-        import pyarrow.parquet as pq
-    except Exception as exc:  # pragma: no cover
-        raise GraphBuildError(
-            "build requires 'pyarrow' to read contacts.parquet. Install it, e.g. pip install pyarrow."
-        ) from exc
-
     stats = BuildStats()
     contact_idx = 0
 
@@ -108,111 +102,41 @@ def build_graph(
         "w", encoding="utf-8", newline=""
     ) as meta_fh:
         edges_fh.write("contig_idx\tcontact_idx\tedge_weight\n")
-        meta_fh.write("contact_idx\tk\tweight\n")
+        meta_fh.write("contact_idx\tk_input\tk_valid\tweight\n")
 
-        parquet = pq.ParquetFile(contacts_parquet)
-        schema = parquet.schema_arrow
-        cols = set(schema.names)
-        if "contigs" not in cols:
-            raise GraphBuildError(f"contacts.parquet missing required column 'contigs'. Found: {schema.names}")
-        has_k = "k" in cols
-        has_weight = "weight" in cols
-        has_contig_weights = "contig_weights" in cols
-        read_cols = (
-            ["contigs"]
-            + (["contig_weights"] if has_contig_weights else [])
-            + (["k"] if has_k else [])
-            + (["weight"] if has_weight else [])
-        )
-
-        for batch in parquet.iter_batches(batch_size=parquet_batch_size, columns=read_cols):
-            data = batch.to_pydict()
-            contigs_list = data["contigs"]
-            contig_weights_list = data.get("contig_weights")
-            k_list = data.get("k")
-            w_list = data.get("weight")
-            n = len(contigs_list)
-            for i in range(n):
+        try:
+            for row in iter_canonical_contact_rows(contacts_parquet, parquet_batch_size=parquet_batch_size):
                 stats.contacts_total += 1
-                contigs_raw = contigs_list[i] or []
-                if not isinstance(contigs_raw, list):
-                    raise GraphBuildError(
-                        f"Invalid contigs type in contacts.parquet (expected list) at row {stats.contacts_total}"
-                    )
-                contigs = [str(c) for c in contigs_raw if str(c)]
-
-                p_weights: Optional[list[float]] = None
-                if contig_weights_list is not None:
-                    w_raw = contig_weights_list[i] or []
-                    if not isinstance(w_raw, list):
-                        raise GraphBuildError(
-                            f"Invalid contig_weights type in contacts.parquet (expected list) at row {stats.contacts_total}"
-                        )
-                    if len(w_raw) != len(contigs_raw):
-                        raise GraphBuildError(
-                            f"Mismatched contigs/contig_weights lengths at row {stats.contacts_total}: "
-                            f"len(contigs)={len(contigs_raw)} len(contig_weights)={len(w_raw)}"
-                        )
-                    # Filter empty contigs and align weights.
-                    pairs = [(str(c), float(w)) for c, w in zip(contigs_raw, w_raw, strict=True) if str(c)]
-                    if pairs:
-                        # Merge duplicates by summing weights (preserve first-seen order).
-                        seen: dict[str, int] = {}
-                        uniq_contigs: list[str] = []
-                        uniq_w: list[float] = []
-                        for c, w in pairs:
-                            if w < 0.0:
-                                raise GraphBuildError(
-                                    f"Negative contig_weight at row {stats.contacts_total}: contig={c!r} w={w}"
-                                )
-                            if c in seen:
-                                uniq_w[seen[c]] += float(w)
-                            else:
-                                seen[c] = len(uniq_contigs)
-                                uniq_contigs.append(c)
-                                uniq_w.append(float(w))
-                        contigs = uniq_contigs
-                        s = float(sum(uniq_w))
-                        if s <= 0.0:
-                            contigs = []
-                            p_weights = []
-                        else:
-                            p_weights = [float(x) / s for x in uniq_w]
-
-                if p_weights is None:
-                    contigs = _dedupe(contigs)
-
-                k = int(k_list[i]) if k_list is not None and k_list[i] is not None else len(contigs)
-                weight = float(w_list[i]) if w_list is not None and w_list[i] is not None else 1.0
-
-                if k < 2 or len(contigs) < 2:
+                if row.k_valid < 2:
                     stats.contacts_skipped_k_lt_2 += 1
                     continue
 
                 try:
-                    onorm = order_norm(k, method=order_norm_method)
+                    onorm = order_norm(row.k_valid, method=order_norm_method)
                 except ValueError as exc:
-                    raise GraphBuildError(f"Invalid k={k} in contacts.parquet: {exc}") from exc
-                edge_weight_base = onorm * weight
+                    raise GraphBuildError(f"Invalid k_valid={row.k_valid} in contacts.parquet: {exc}") from exc
+                edge_weight_base = onorm * row.weight
 
-                meta_fh.write(f"{contact_idx}\t{k}\t{weight:.10g}\n")
-                stats.k_counter[k] += 1
-                stats.add_weight(weight)
+                meta_fh.write(f"{contact_idx}\t{row.k_input}\t{row.k_valid}\t{row.weight:.10g}\n")
+                stats.k_counter[row.k_valid] += 1
+                stats.add_weight(row.weight)
                 stats.contacts_kept += 1
 
-                for j, contig in enumerate(contigs):
+                for j, contig in enumerate(row.contigs):
                     idx = contig_to_idx.get(contig)
                     if idx is None:
                         raise GraphBuildError(
                             f"Contig '{contig}' in contacts.parquet not found in FASTA '{contigs_fasta}'."
                         )
                     edge_weight = edge_weight_base
-                    if p_weights is not None:
-                        edge_weight *= float(p_weights[j])
+                    if row.contig_weights is not None:
+                        edge_weight *= float(row.contig_weights[j])
                     edges_fh.write(f"{idx}\t{contact_idx}\t{edge_weight:.10g}\n")
                     stats.edges_written += 1
 
                 contact_idx += 1
+        except ContactHypergraphError as exc:
+            raise GraphBuildError(str(exc)) from exc
 
     if stats.contacts_kept == 0:
         raise GraphBuildError("No usable contacts after filtering (k<2).")
@@ -234,9 +158,11 @@ def build_graph(
         "input_contacts_parquet": str(contacts_parquet),
         "order_norm_method": order_norm_method,
         "order_norm_formula": _order_norm_formula(order_norm_method),
+        "contact_order_semantics": "k_valid_after_canonicalization",
+        "contacts_meta_columns": ["contact_idx", "k_input", "k_valid", "weight"],
         "edge_weight_formula": (
-            "edge_weight = OrderNorm(k) * contact_weight"
-            + (" * contig_weight (if contig_weights present)" if "contig_weights" in cols else "")
+            "edge_weight = OrderNorm(k_valid) * contact_weight"
+            " * contig_weight (if contig_weights present in contacts.parquet)"
         ),
         "num_contigs": len(contig_names),
         "num_contacts": stats.contacts_kept,
@@ -258,17 +184,6 @@ def build_graph(
         f"Wrote graph: contigs={meta['num_contigs']}, contacts={meta['num_contacts']}, edges={meta['num_edges']}"
     )
     return out_graph_dir
-
-
-def _dedupe(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for x in items:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
 
 
 def _k_summary(k_counter: Counter[int]) -> dict[str, Any]:
