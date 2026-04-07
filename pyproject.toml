@@ -35,3 +35,6 @@ porebin = "porebin.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["porebin*"]
+
+[tool.setuptools.package-data]
+porebin = ["scg_db/*.json", "scg_db/*.hmm", "scg_db/*.tsv", "scg_db/*.txt"]

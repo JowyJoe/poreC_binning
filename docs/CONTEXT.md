@@ -15,7 +15,7 @@ The authoritative repository reference is:
 - Main coarse path:
   joint contact-feature hypergraph spectral clustering
 - Main refine path:
-  `refine_bins_parquet(...)` with soft-gated host-assignment inference
+  `refine_bins_parquet(...)` with conservative host binning and residual relation mining
 - Main export path:
   `porebin/export.py`
 
@@ -35,7 +35,8 @@ Or:
 
 - PPL `.contacts` normalization in `porebin/normalize.py`
 - pairwise baseline in `porebin/pairwise_baseline.py`
-- legacy refine path `refine_bins(...)` in `porebin/refine.py`
+- legacy spectral bisection helpers in `porebin/cluster_legacy.py`
+- legacy refine path `refine_bins(...)` in `porebin/refine_legacy.py`
 
 For the current mathematical definitions, file inventory, CLI interfaces, and legacy-path details, use:
 

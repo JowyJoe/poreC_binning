@@ -1,3 +1,15 @@
+"""
+User-facing CLI for the current porebin mainline.
+
+Recommended architecture:
+  - `cluster` produces coarse initial bins
+  - `refine` produces final bins plus `residual_pool.tsv`
+  - `associate` consumes the residual pool for downstream relation mining
+
+Compatibility and legacy paths may still exist internally, but they are not the
+recommended public workflow.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,6 +17,7 @@ from pathlib import Path
 import typer
 
 from porebin import __version__
+from porebin.associate import AssociateError, associate_residuals
 from porebin.bam_contacts import BamContactsError, bam_to_contacts_parquet
 from porebin.build_graph import GraphBuildError, build_graph
 from porebin.cluster import (
@@ -24,7 +37,14 @@ from porebin.utils import (
     write_json,
 )
 
-app = typer.Typer(add_completion=False, help="porebin: bin metagenomes from Pore-C multi-way contacts.")
+app = typer.Typer(
+    add_completion=False,
+    help=(
+        "porebin: hypergraph metagenome binning from Pore-C multi-way contacts. "
+        "Mainline: cluster -> initial bins; refine -> final bins + residual_pool.tsv; "
+        "associate -> downstream residual/MGE/accessory relation mining."
+    ),
+)
 
 
 @app.callback()
@@ -82,6 +102,12 @@ def build(
     ),
     parquet_batch_size: int = typer.Option(100_000, "--parquet-batch-size", help="Parquet batch size."),
 ) -> None:
+    """
+    Build graph-side indices and metadata from `contacts.parquet`.
+
+    This is a preprocessing/indexing step for downstream coarse clustering, not a
+    binning result by itself.
+    """
     out = out.resolve()
     params = {
         "contigs": str(contigs),
@@ -120,6 +146,12 @@ def cluster(
         help="Optional (kept for backwards compatibility; currently unused by spectral v2).",
     ),
 ) -> None:
+    """
+    Hypergraph coarse clustering.
+
+    This stage performs joint contact-feature hypergraph clustering and writes
+    coarse `bins.tsv`, which serves as the initial-bin input to `refine`.
+    """
     out = out.resolve()
     params = {
         "graph": str(graph),
@@ -153,6 +185,12 @@ def export(
     bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Bins TSV (e.g. coarse/bins.tsv or refined/bins.refined.tsv)."),
     out: Path = typer.Option(..., "--out", help="Output directory."),
 ) -> None:
+    """
+    Materialize FASTA outputs from an existing bins assignment.
+
+    This is a presentation/export layer. It is not the authoritative inference
+    stage for final bin membership.
+    """
     out = out.resolve()
     params = {"contigs": str(contigs), "bins_tsv": str(bins_tsv), "out": str(out)}
     with record_run(out, command="export", params=params, seed=None) as run_record:
@@ -186,6 +224,28 @@ def refine(
     ),
     out: Path = typer.Option(..., "--out", help="Output directory (refined/)."),
 ) -> None:
+    """
+    Post-binning refinement.
+
+    Inputs:
+      - coarse `bins.tsv`
+      - `contacts.parquet`
+
+    Primary outputs:
+      - `bins.refined.tsv`
+      - `residual_pool.tsv`
+
+    QC / audit outputs:
+      - `bin_qc.refined.tsv`
+      - `refine_actions.tsv`
+      - `run_refine.json`
+
+    Compatibility / transition output:
+      - `contig_host_scores.tsv`
+
+    `refine` does not own downstream association mining; that responsibility lives
+    in the separate `associate` command.
+    """
     out = out.resolve()
     params = {
         "contigs": str(contigs),
@@ -194,11 +254,8 @@ def refine(
         "coverage_tsv": str(coverage_tsv) if coverage_tsv is not None else None,
         "out": str(out),
     }
-    # refine is a host-assignment inference layer on top of coarse candidate host communities.
-    # It writes out/run_refine.json plus:
-    #   - bins.refined.tsv (core-like contigs only)
-    #   - contig_host_scores.tsv (all contigs)
-    #   - accessory_associations.tsv (accessory/MGE-like association head)
+    # Public refine outputs center on final bins and the explicit residual handoff.
+    # `contig_host_scores.tsv` remains only as a compatibility / audit bridge.
     with record_run(out, command="refine", params=params, seed=None):
         try:
             refine_bins_parquet(
@@ -209,6 +266,59 @@ def refine(
                 out_dir=out,
             )
         except (RefineError, FileNotFoundError) as exc:
+            _die(str(exc))
+
+
+@app.command()
+def associate(
+    bins_tsv: Path = typer.Option(..., "--bins-tsv", help="Final refined bins TSV (refined/bins.refined.tsv)."),
+    residual_pool_tsv: Path = typer.Option(..., "--residual-pool-tsv", help="Residual pool TSV from refine."),
+    contacts: Path = typer.Option(..., "--contacts", help="contacts.parquet produced by bam2contacts."),
+    out: Path = typer.Option(..., "--out", help="Output directory (associate/)."),
+    contig_scores_tsv: Path | None = typer.Option(
+        None,
+        "--contig-scores-tsv",
+        help="Optional compatibility bridge from refine (refined/contig_host_scores.tsv).",
+    ),
+) -> None:
+    """
+    Downstream association analysis.
+
+    Inputs:
+      - `bins.refined.tsv`
+      - `residual_pool.tsv`
+
+    Primary output:
+      - `associations.tsv`
+
+    This command consumes residuals after refine. It does not rewrite final bins.
+    """
+    out = out.resolve()
+    params = {
+        "bins_tsv": str(bins_tsv),
+        "residual_pool_tsv": str(residual_pool_tsv),
+        "contacts": str(contacts),
+        "out": str(out),
+        "contig_scores_tsv": str(contig_scores_tsv) if contig_scores_tsv is not None else None,
+    }
+    with record_run(out, command="associate", params=params, seed=None) as run_record:
+        try:
+            associations_tsv = associate_residuals(
+                bins_refined_tsv=bins_tsv,
+                residual_pool_tsv=residual_pool_tsv,
+                contacts_parquet=contacts,
+                out_dir=out,
+                contig_scores_tsv=contig_scores_tsv,
+            )
+            run_record["decisions"] = {
+                "associate_role": "downstream_residual_relation_mining",
+                "final_bins_read_only": True,
+                "compatibility_contig_scores_used": contig_scores_tsv is not None,
+            }
+            run_record["outputs"] = {
+                "associations_tsv": str(associations_tsv),
+            }
+        except (AssociateError, FileNotFoundError) as exc:
             _die(str(exc))
 
 
@@ -250,13 +360,18 @@ def run_bam(
     refine: bool = typer.Option(
         True,
         "--refine/--no-refine",
-        help="Run refine after coarse binning (recommended for low contamination).",
+        help="Run post-binning refine after coarse clustering to produce final bins plus residual_pool.tsv.",
     ),
 ) -> None:
     """
     End-to-end BAM pipeline:
       - default (hypergraph): bam2contacts -> build -> coarse cluster -> (optional) refine
       - baseline (--pairwise-baseline): BAM -> pairwise graph -> Leiden
+
+    Output semantics:
+      - coarse cluster writes initial `bins.tsv`
+      - refine writes final `bins.refined.tsv` plus `residual_pool.tsv`
+      - downstream association is a separate command (`associate`)
     """
     out = out.resolve()
     params = {

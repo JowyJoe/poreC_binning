@@ -24,7 +24,7 @@ Its defining design choices are:
 - preserve each multi-way Pore-C read as one hyperedge
 - avoid clique expansion in the main hypergraph pipeline
 - combine a contact hypergraph and a feature hypergraph for coarse clustering
-- run a refine stage that performs host-assignment inference rather than just another hard clustering pass
+- run a refine stage that performs conservative host-centric binning first, then residual relation mining for non-binned contigs
 
 ### 1.2 Current main path
 
@@ -46,7 +46,7 @@ In this path:
 - `contacts.parquet` is the evidence-layer source of truth
 - the canonical contact row logic lives in `porebin/contact_hypergraph.py`
 - coarse clustering uses the joint contact-feature hypergraph spectral path
-- refine uses the parquet-based host-assignment inference path
+- refine uses the parquet-based conservative host-binning / residual-relation path
 
 ### 1.2.1 `seed` and `threads` in the current main path
 
@@ -75,8 +75,8 @@ The repository also contains older or auxiliary paths:
 
 - PPL `.contacts` normalization path in `porebin/normalize.py`
 - pairwise clique-expansion baseline in `porebin/pairwise_baseline.py`
-- legacy refine path `refine_bins(...)` in `porebin/refine.py`
-- legacy spectral bisection helpers still kept inside `porebin/cluster.py`
+- legacy refine path `refine_bins(...)` in `porebin/refine_legacy.py`
+- legacy spectral bisection helpers in `porebin/cluster_legacy.py`
 - simple FASTA exporter in `porebin/export_bins.py`
 
 These are still part of the repository and are documented below, but they are not the primary path for the current hypergraph pipeline.
@@ -335,13 +335,13 @@ Implementation:
 - `seed` controls the eigensolver initialization vector
 - `threads` is passed to HDBSCAN when the implementation supports parallel core-distance computation
 
-This produces coarse bins interpreted as candidate host communities.
+This produces coarse bins interpreted as candidate host communities for downstream anchor discovery.
 
-### 3.7 Refine host-assignment inference
+### 3.7 Refine: conservative host binning and residual relation mining
 
 The current refine path is `refine_bins_parquet(...)`.
 
-Coarse bins are not treated as final truth. They are candidate host communities.
+Coarse bins are not treated as final truth. They are candidate host communities used for anchor discovery and later conservative binning.
 
 Implementation note for the current main path:
 
@@ -362,7 +362,16 @@ with the current piecewise status weights:
 - `weak -> 0.35`
 - `impure -> 0.0`
 
-#### Anchor-like contig weights
+Only non-impure bins remain candidate hosts in the parquet refine path.
+
+#### Anchor discovery
+
+The existing pre-cleanup stage still computes:
+
+- `anchor_mask[c]`
+- `anchor_weight[c]`
+- `bin_status[b]`
+- `bin_weight[b]`
 
 For contig `c`, using pre-refine support statistics:
 
@@ -387,41 +396,50 @@ If the discrete `anchor_mask[c]` is true, the implementation enforces:
 a_c \leftarrow \max(a_c, 0.85)
 ```
 
-#### Soft-gated host mass per read
+The parquet refine path then derives a stricter `hard_anchor_mask`:
 
-For one read/contact `r` and host bin `b`:
+- `strong` bins: every anchor contig becomes a hard anchor
+- `weak` bins: only the single best anchor becomes a hard anchor
+- `impure` bins: no hard anchors
+
+Hard anchors are the only contigs allowed to define read-level host direction during conservative binning.
+
+#### Read qualification
+
+For each canonical contact row, the current refine path first summarizes hard-anchor support by host. Reads are classified as:
+
+- `informative`: one host direction is clearly dominant
+- `anchor_sparse`: there is not enough hard-anchor support to define a direction
+- `anchor_conflict`: there are hard anchors, but they do not support one clearly dominant host
+
+The current implementation uses a simple dominance-ratio veto:
+
+- `dominance_ratio = top1_anchor_mass / (top2_anchor_mass + eps)`
+- `dominance_ratio >= 2.0` is required for an `informative` read
+
+`anchor_sparse` reads do not vote.
+
+`anchor_conflict` reads are excluded from conservative host binning, but their support can still accumulate into the residual relation head.
+
+#### Conservative host-support update
+
+The refine support map `support[c][b]` still accumulates contact-driven host support, but now the source of read-level host direction is restricted:
 
 ```math
-M_r(b) = \sum_{u: b_0(u)=b} w_b \, a_u \, \pi_{r,u}
+\theta_{c,b} \mathrel{+}= q(r)\,\pi_{r,c}\,\max(0, A_r(b)-s^{\mathrm{hard}}_{r,c,b})
 ```
 
-where:
+where `A_r(b)` is the hard-anchor host mass for read `r` and host `b`, and `s^{hard}_{r,c,b}` removes the target contig's own hard-anchor contribution when applicable.
 
-- `w_b = bin_weight(b)`
-- `a_u = anchor_weight(u)`
-- `b_0(u)` is the coarse host label of `u`
+Operationally, this means:
 
-#### Support update
+- only hard anchors define read-level host direction
+- target contigs never define their own read-level host direction
+- no informative hard anchors means the read does not support conservative binning
 
-The current refine support update is:
+#### Weak coarse prior
 
-```math
-\theta_{c,b} \mathrel{+}= q(r)\,\pi_{r,c}\,\max(0, M_r(b)-s_{r,c,b})
-```
-
-with self-mass:
-
-```math
-s_{r,c,b} =
-\begin{cases}
-w_b\,a_c\,\pi_{r,c}, & \text{if } b_0(c)=b \\
-0, & \text{otherwise}
-\end{cases}
-```
-
-#### Coarse prior
-
-The current weak coarse-label prior is:
+The current weak coarse-label prior is still used, but only when the contig already has informative-read support or is itself a hard anchor:
 
 ```math
 \alpha_c = \mathrm{prior\_strength} \cdot w_{b_0(c)} \cdot (\mathrm{sum\_support}(c)+\varepsilon)
@@ -429,17 +447,11 @@ The current weak coarse-label prior is:
 
 with `prior_strength = 0.05`.
 
-#### Posterior-like normalized host support
+This keeps the coarse prior as a regularizer rather than allowing it to create an apparently interpretable host assignment from zero evidence.
 
-For each contig:
+#### Conservative binning states
 
-```math
-\hat{\theta}_{c,b} =
-\frac{\theta_{c,b} + \varepsilon}
-{\sum_{b' \in B} (\theta_{c,b'} + \varepsilon)}
-```
-
-The implementation then reports:
+For each contig, the parquet refine path computes normalized host support and uncertainty summaries:
 
 - `top1_host`
 - `top2_host`
@@ -447,19 +459,26 @@ The implementation then reports:
 - `entropy`
 - `effective_hosts = exp(entropy)`
 
-#### Core-like vs accessory-like
+It then assigns one of the following refine states:
 
-The current implementation uses fixed thresholds:
+- `assigned_bin`
+- `relation_only`
+- `abstain_insufficient_information`
+- `abstain_conflicting_evidence`
+- `abstain_unreliable_background`
 
-- core-like:
-  `top1_score >= 0.80`, `margin >= 0.50`, `effective_hosts <= 1.5`
-- accessory candidate:
-  `effective_hosts >= 2.0`
-  or `entropy >= log(2)` and `top1_score < 0.85`
+The current assignment policy is intentionally conservative:
 
-Core-like contigs are written to `bins.refined.tsv`.
+- hard anchors in candidate hosts are directly retained in the final refined bins
+- non-anchor contigs enter `bins.refined.tsv` only when the coarse host remains dominant, the score margin is strong enough, and there are enough informative reads
+- contigs with residual multi-host structure but without safe bin membership remain `relation_only`
+- low-information or unstable contigs enter one of the abstain states
 
-Accessory-like contigs are written to `accessory_associations.tsv`.
+#### Outputs
+
+- `bins.refined.tsv` contains only `assigned_bin` contigs
+- `contig_host_scores.tsv` contains the full refine-state summary for all contigs
+- `accessory_associations.tsv` contains only `relation_only` contigs and does not modify the refined bins
 
 ### 3.8 Pairwise baseline
 
@@ -710,7 +729,7 @@ This converts an older PPL `.contacts` TSV layout into a simpler `contacts.parqu
 
 #### Legacy refine path
 
-- `refine_bins(...)` in `porebin/refine.py`
+- `refine_bins(...)` in `porebin/refine_legacy.py`
 
 This older path is based on:
 
@@ -722,7 +741,12 @@ and still keeps BAM/PPL-era logic. It is not the current CLI refine path.
 
 #### Legacy spectral helpers
 
-Inside `porebin/cluster.py`, the following bisection helpers are historical/legacy:
+These historical bisection helpers now live in `porebin/cluster_legacy.py`.
+
+`porebin/cluster.py` compatibility-imports them so older callers that still import from
+`porebin.cluster` do not break during the refactor.
+
+The helper set is:
 
 - `_choose_k_by_eigengap`
 - `_graph_bic_trigger`
@@ -912,7 +936,8 @@ Purpose:
 
 - orchestrate coarse clustering
 - provide pairwise baseline clustering
-- keep historical bisection helpers
+- keep the active coarse-clustering entrypoints small
+- compatibility-import legacy spectral helpers from `porebin/cluster_legacy.py`
 
 Current active interfaces:
 
@@ -927,7 +952,7 @@ Metadata/input helpers:
 - `_read_edges(path, contig_offset)`
 - `_read_incidence(path)`
 
-Historical bisection helpers:
+Compatibility exports for legacy callers:
 
 - `_choose_k_by_eigengap(...)`
 - `_read_contig_lengths(...)`
@@ -945,22 +970,51 @@ Historical bisection helpers:
 - `_loglik_2gmm(xs)`
 - `_log_norm_pdf(x, mu, var)`
 
-### 7.9 Refine layer
+#### `porebin/cluster_legacy.py`
+
+Purpose:
+
+- keep legacy spectral bisection logic out of the active coarse path
+- preserve the historical helper implementations used by older paths
+
+Interfaces:
+
+- `_choose_k_by_eigengap(...)`
+- `_read_contig_lengths(...)`
+- `_auto_min_contig_len(...)`
+- `_coverage_from_bam(...)`
+- `_coverage_from_tsv(...)`
+- `_graph_bic_trigger(...)`
+- `_divisive_bisect_by_auto_bic(...)`
+- `_divisive_bisect_by_coverage_bic(...)`
+- `_spectral_sweep_bisect(...)`
+- `_sweep_best_conductance(...)`
+- `_coverage_bic_trigger(values)`
+- `_bic(xs, k)`
+- `_loglik_1gauss(xs)`
+- `_loglik_2gmm(xs)`
+- `_log_norm_pdf(x, mu, var)`
+
+### 7.9 Refine module
 
 #### `porebin/refine.py`
 
 Purpose:
 
-- host-assignment inference
+- conservative host-centric binning
+- residual relation mining for non-binned contigs
 - parquet refine main path
-- older BAM/PPL-era refine path and helpers
+- keep shared refine helpers used by the parquet path
+- compatibility-export the legacy `refine_bins(...)` entrypoint from `porebin/refine_legacy.py`
 
 Core interfaces:
 
 - `RefineError`
 - `RefineStats`
 - `PreCleanupResult`
+- `ReadAnchorEvidence`
 - `pre_refine_cleanup(...)`
+- `_summarize_read_anchor_evidence(...)`
 - `_entropy(probs)`
 - `_effective_hosts(entropy_nats)`
 - `_clip01(x)`
@@ -987,10 +1041,6 @@ Common helpers:
 - `_coverage_from_tsv(...)`
 - `_bin_coverage_stats(...)`
 
-Legacy PPL support scan:
-
-- `_scan_contacts_support_and_affinity(...)`
-
 Parquet support scan:
 
 - `_iter_contacts_parquet(...)`
@@ -1014,8 +1064,6 @@ Note:
 Legacy refine helpers:
 
 - `_decontam(...)`
-- `_recruit(...)`
-- `_split_bins(...)`
 
 Induced graph helper:
 
@@ -1034,6 +1082,20 @@ Scoring / threshold helpers:
 - `_loglik_1gauss(xs)`
 - `_loglik_2gmm(xs)`
 - `_log_norm_pdf(x, mu, var)`
+
+#### `porebin/refine_legacy.py`
+
+Purpose:
+
+- keep the older BAM/PPL-era refine pipeline out of the active parquet refine file
+- preserve the legacy `refine_bins(...)` implementation and its PPL-specific helpers
+
+Interfaces:
+
+- `refine_bins(...)`
+- `_scan_contacts_support_and_affinity(...)`
+- `_recruit(...)`
+- `_split_bins(...)`
 
 ### 7.10 Pairwise baseline
 
@@ -1194,7 +1256,7 @@ Role:
 
 ### `tests/test_refine_mvp.py`
 
-- checks parquet refine outputs, accessory head behavior, and soft-gated weak-bin behavior
+- checks parquet refine outputs, residual relation behavior, and weak-bin hard-anchor behavior
 
 ### `tests/test_pairwise_baseline.py`
 
