@@ -924,7 +924,7 @@ Interfaces:
 - `make_theta_operator(H_csr, W, De, Dv)`
 - `_auto_d(V)`
 - `spectral_embed_joint(...)`
-- `hdbscan_cluster(Z, min_cluster_size, threads)`
+- `hdbscan_cluster(Z, min_cluster_size, min_samples, selection_method, threads)`
 - `write_bins_tsv(out_bins_tsv, idx_to_name, labels)`
 - `json_dumps_small(obj)`
 
@@ -944,6 +944,17 @@ Current active interfaces:
 - `GraphClusterError`
 - `cluster_spectral_hypergraph(...)`
 - `cluster_leiden_pairwise(...)`
+
+Current coarse-control parameters exposed by the active spectral path include:
+
+- `lambda_contact`
+- `feature_mode`
+- `feature_knn_k`
+- `embedding_dim`
+- `hdbscan_min_cluster_size`
+- `hdbscan_min_samples`
+- `hdbscan_selection_method`
+- `contact_postprocess`
 
 Metadata/input helpers:
 

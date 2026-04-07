@@ -13,6 +13,49 @@ class GraphClusterError(RuntimeError):
     pass
 
 
+def _count_labels(labels: "object") -> tuple[int, int]:
+    import numpy as np
+
+    labels = np.asarray(labels, dtype=int)
+    uniq = {int(x) for x in labels.tolist() if int(x) != -1}
+    noise = int(np.sum(labels == -1))
+    return int(len(uniq)), int(noise)
+
+
+def _contact_feature_neighbor_overlap_mean(contact_H_csr: "object", neighbors: "object") -> float:
+    import numpy as np
+
+    Hcsc = contact_H_csr.tocsc()
+    V = int(contact_H_csr.shape[0])
+    neigh = np.asarray(neighbors, dtype=np.int32)
+    if neigh.ndim != 2 or neigh.shape[0] != V:
+        return 0.0
+
+    indptr = Hcsc.indptr
+    indices = Hcsc.indices
+    contact_neighbors: list[set[int]] = [set() for _ in range(V)]
+    for e in range(int(Hcsc.shape[1])):
+        start = int(indptr[e])
+        end = int(indptr[e + 1])
+        if end - start < 2:
+            continue
+        vs = [int(v) for v in indices[start:end]]
+        members = set(vs)
+        for v in vs:
+            contact_neighbors[v].update(members)
+            contact_neighbors[v].discard(v)
+
+    overlaps: list[float] = []
+    for v in range(V):
+        feat = {int(u) for u in neigh[v].tolist() if int(u) != v and int(u) >= 0}
+        if not feat:
+            overlaps.append(0.0)
+            continue
+        cn = contact_neighbors[v]
+        overlaps.append(float(len(feat & cn)) / float(len(feat)))
+    return float(sum(overlaps) / len(overlaps)) if overlaps else 0.0
+
+
 def cluster_spectral_hypergraph(
     *,
     graph_dir: Path,
@@ -20,6 +63,14 @@ def cluster_spectral_hypergraph(
     seed: int = 0,
     bam: Optional[Path] = None,
     threads: int = 1,
+    lambda_contact: Optional[float] = None,
+    feature_mode: str = "tnf_plus_cov",
+    feature_knn_k: int = 15,
+    embedding_dim: Optional[int] = None,
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: Optional[int] = None,
+    hdbscan_selection_method: str = "leaf",
+    contact_postprocess: bool = True,
     logger: Optional[logging.Logger] = None,
 ) -> dict:
     """
@@ -69,6 +120,7 @@ def cluster_spectral_hypergraph(
         make_theta_operator,
         postprocess_labels_by_contact_components,
         spectral_embed_joint,
+        summarize_contact_components,
         write_bins_tsv,
         zscore_features,
     )
@@ -90,42 +142,80 @@ def cluster_spectral_hypergraph(
     # Optional coverage.tsv is used only as a feature; no BAM scan in v2.
     cov_path = graph_dir.parent / "coverage" / "coverage.tsv"
     cov_path = cov_path if cov_path.exists() else None
-    lambda_contact = 0.6 if cov_path is not None else 0.7
-    knn_k = 15
+    feature_mode = str(feature_mode).strip().lower()
+    if feature_mode not in {"tnf_plus_cov", "tnf_only"}:
+        raise GraphClusterError(
+            f"Unknown feature_mode {feature_mode!r}. Use 'tnf_plus_cov' or 'tnf_only'."
+        )
+    lambda_contact_value = (
+        float(lambda_contact) if lambda_contact is not None else (0.6 if cov_path is not None else 0.7)
+    )
+    knn_k = max(1, int(feature_knn_k))
+    hdbscan_min_cluster_size = max(2, int(hdbscan_min_cluster_size))
+    hdbscan_selection_method = str(hdbscan_selection_method).strip().lower()
+    if hdbscan_selection_method not in {"leaf", "eom"}:
+        raise GraphClusterError(
+            f"Unknown HDBSCAN selection method {hdbscan_selection_method!r}. Use 'leaf' or 'eom'."
+        )
 
     try:
         contact = build_contact_incidence_from_parquet(contacts_parquet, contig_name_to_idx, logger=logger)
+        contact_component_stats = summarize_contact_components(contact.H_csr)
         X_comp = load_or_build_tnf136_features(
             graph_dir=graph_dir, contigs_fasta=contigs_fasta, contig_name_to_idx=contig_name_to_idx, logger=logger
         )
         x_cov, coverage_missing_count, coverage_used = load_coverage_feature_optional(cov_path, contig_name_to_idx)
-        X = np.concatenate([X_comp.astype(np.float32, copy=False), x_cov.reshape(-1, 1)], axis=1)
+        if feature_mode == "tnf_only":
+            X = X_comp.astype(np.float32, copy=False)
+        else:
+            X = np.concatenate([X_comp.astype(np.float32, copy=False), x_cov.reshape(-1, 1)], axis=1)
         X = zscore_features(X)
 
         neighbors = build_feature_knn_edges(X, knn_k)
         feature = build_feature_incidence(neighbors, knn_k)
+        neighbor_overlap_mean = _contact_feature_neighbor_overlap_mean(contact.H_csr, neighbors)
 
         contact_theta = make_theta_operator(contact.H_csr, contact.W, contact.De, contact.Dv)
         feature_theta = make_theta_operator(feature.H_csr, feature.W, feature.De, feature.Dv)
 
-        d = min(128, max(32, int(math.floor(math.log2(float(V)))) * 4))
-        d = min(d, max(1, V - 2))
+        if embedding_dim is None:
+            d = min(128, max(32, int(math.floor(math.log2(float(V)))) * 4))
+            d = min(d, max(1, V - 2))
+        else:
+            d = max(1, min(int(embedding_dim), max(1, V - 2)))
 
         Z = spectral_embed_joint(
             contact_op=contact_theta.op,
             feature_op=feature_theta.op,
-            lambda_contact=lambda_contact,
+            lambda_contact=lambda_contact_value,
             d=int(d),
             seed=seed,
         )
 
-        labels, hmeta = hdbscan_cluster(Z, min_cluster_size=5, threads=threads)
+        labels, hmeta = hdbscan_cluster(
+            Z,
+            min_cluster_size=hdbscan_min_cluster_size,
+            min_samples=hdbscan_min_samples,
+            selection_method=hdbscan_selection_method,
+            threads=threads,
+        )
+        hdbscan_raw_bins, hdbscan_raw_noise = _count_labels(labels)
         # Contact-isolated contigs are treated as unbinned.
         labels = np.asarray(labels, dtype=int)
         labels[np.asarray(contact.isolated_mask_contact, dtype=bool)] = -1
-        labels, pp = postprocess_labels_by_contact_components(
-            labels, contact.H_csr, min_cluster_size=5
-        )
+        if bool(contact_postprocess):
+            labels, pp = postprocess_labels_by_contact_components(
+                labels, contact.H_csr, min_cluster_size=hdbscan_min_cluster_size
+            )
+        else:
+            from porebin.hypergraph_joint_spectral import ContactComponentPostprocessMeta
+
+            pp = ContactComponentPostprocessMeta(
+                components_total=contact_component_stats.components_total,
+                components_promoted_from_noise=0,
+                noise_reassigned_by_component=0,
+                labels_split_by_component=0,
+            )
 
         num_bins, unbinned = write_bins_tsv(out_bins_tsv, idx_to_name, labels)
         logger.info("Wrote bins: %s", out_bins_tsv)
@@ -141,15 +231,28 @@ def cluster_spectral_hypergraph(
         return {
             "method": "spectral_v2_joint_contact_feature_hdbscan",
             "spectral_v2_joint_enabled": True,
-            "lambda_contact": float(lambda_contact),
+            "lambda_contact": float(lambda_contact_value),
+            "lambda_feature": float(1.0 - lambda_contact_value),
+            "feature_mode": feature_mode,
             "d": int(d),
             "knn_k": int(knn_k),
             "dropped_edges_singleton_contact": int(contact.dropped_edges_singleton_contact),
             "isolated_contigs_count_contact": int(np.sum(contact.isolated_mask_contact)),
+            "isolated_contigs_fraction_contact": float(np.sum(contact.isolated_mask_contact) / max(1, V)),
+            "contact_components_total": int(contact_component_stats.components_total),
+            "largest_contact_component_size": int(contact_component_stats.largest_component_size),
+            "largest_contact_component_share": float(contact_component_stats.largest_component_share),
+            "contact_feature_neighbor_overlap_mean": float(neighbor_overlap_mean),
             "coverage_tsv": (str(cov_path) if cov_path is not None else None),
             "coverage_used": bool(coverage_used),
             "coverage_missing_count": int(coverage_missing_count),
+            "coverage_missing_fraction": float(coverage_missing_count / max(1, V)),
+            "embedding_dim_effective": int(Z.shape[1]),
             "hdbscan": hmeta,
+            "hdbscan_raw_bins": int(hdbscan_raw_bins),
+            "hdbscan_raw_noise_count": int(hdbscan_raw_noise),
+            "hdbscan_raw_noise_fraction": float(hdbscan_raw_noise / max(1, V)),
+            "contact_postprocess_enabled": bool(contact_postprocess),
             "contact_component_postprocess": {
                 "components_total": pp.components_total,
                 "components_promoted_from_noise": pp.components_promoted_from_noise,

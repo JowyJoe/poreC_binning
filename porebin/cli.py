@@ -140,6 +140,38 @@ def cluster(
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed."),
     threads: int = typer.Option(1, "--threads", help="Threads hint for coarse clustering."),
+    lambda_contact: float | None = typer.Option(
+        None, "--lambda-contact", help="Override contact weight in joint coarse clustering."
+    ),
+    feature_mode: str = typer.Option(
+        "tnf_plus_cov",
+        "--feature-mode",
+        help="Feature layer for coarse clustering: tnf_plus_cov or tnf_only.",
+    ),
+    feature_knn_k: int = typer.Option(15, "--feature-knn-k", help="kNN neighborhood size for feature hypergraph."),
+    embedding_dim: int | None = typer.Option(
+        None,
+        "--embedding-dim",
+        help="Override coarse spectral embedding dimension. Default uses the current automatic rule.",
+    ),
+    hdbscan_min_cluster_size: int = typer.Option(
+        5, "--hdbscan-min-cluster-size", help="HDBSCAN min_cluster_size for coarse clustering."
+    ),
+    hdbscan_min_samples: int | None = typer.Option(
+        None,
+        "--hdbscan-min-samples",
+        help="Optional HDBSCAN min_samples override for coarse clustering.",
+    ),
+    hdbscan_selection_method: str = typer.Option(
+        "leaf",
+        "--hdbscan-selection-method",
+        help="HDBSCAN cluster_selection_method: leaf or eom.",
+    ),
+    contact_postprocess: bool = typer.Option(
+        True,
+        "--contact-postprocess/--no-contact-postprocess",
+        help="Enable or disable contact-component postprocessing after HDBSCAN.",
+    ),
     bam: Path | None = typer.Option(
         None,
         "--bam",
@@ -159,6 +191,14 @@ def cluster(
         "method": method,
         "seed": seed,
         "threads": threads,
+        "lambda_contact": lambda_contact,
+        "feature_mode": feature_mode,
+        "feature_knn_k": feature_knn_k,
+        "embedding_dim": embedding_dim,
+        "hdbscan_min_cluster_size": hdbscan_min_cluster_size,
+        "hdbscan_min_samples": hdbscan_min_samples,
+        "hdbscan_selection_method": hdbscan_selection_method,
+        "contact_postprocess": contact_postprocess,
         "bam": str(bam) if bam is not None else None,
     }
     with record_run(out, command="cluster", params=params, seed=seed) as run_record:
@@ -171,6 +211,14 @@ def cluster(
                     seed=seed,
                     bam=bam,
                     threads=threads,
+                    lambda_contact=lambda_contact,
+                    feature_mode=feature_mode,
+                    feature_knn_k=feature_knn_k,
+                    embedding_dim=embedding_dim,
+                    hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+                    hdbscan_min_samples=hdbscan_min_samples,
+                    hdbscan_selection_method=hdbscan_selection_method,
+                    contact_postprocess=contact_postprocess,
                 )
                 run_record["decisions"] = {"cluster_method": "spectral", **meta}
             else:
@@ -356,6 +404,38 @@ def run_bam(
         "--coarse-method",
         help="Coarse clustering method: spectral (joint hypergraph spectral embedding + HDBSCAN).",
     ),
+    lambda_contact: float | None = typer.Option(
+        None, "--lambda-contact", help="Override contact weight in joint coarse clustering."
+    ),
+    feature_mode: str = typer.Option(
+        "tnf_plus_cov",
+        "--feature-mode",
+        help="Feature layer for coarse clustering: tnf_plus_cov or tnf_only.",
+    ),
+    feature_knn_k: int = typer.Option(15, "--feature-knn-k", help="kNN neighborhood size for feature hypergraph."),
+    embedding_dim: int | None = typer.Option(
+        None,
+        "--embedding-dim",
+        help="Override coarse spectral embedding dimension. Default uses the current automatic rule.",
+    ),
+    hdbscan_min_cluster_size: int = typer.Option(
+        5, "--hdbscan-min-cluster-size", help="HDBSCAN min_cluster_size for coarse clustering."
+    ),
+    hdbscan_min_samples: int | None = typer.Option(
+        None,
+        "--hdbscan-min-samples",
+        help="Optional HDBSCAN min_samples override for coarse clustering.",
+    ),
+    hdbscan_selection_method: str = typer.Option(
+        "leaf",
+        "--hdbscan-selection-method",
+        help="HDBSCAN cluster_selection_method: leaf or eom.",
+    ),
+    contact_postprocess: bool = typer.Option(
+        True,
+        "--contact-postprocess/--no-contact-postprocess",
+        help="Enable or disable contact-component postprocessing after HDBSCAN.",
+    ),
     resolution: float = typer.Option(1.0, "--resolution", help="Leiden resolution parameter (pairwise baseline only)."),
     refine: bool = typer.Option(
         True,
@@ -387,6 +467,14 @@ def run_bam(
         "contacts_parquet_batch_size": contacts_parquet_batch_size,
         "build_parquet_batch_size": build_parquet_batch_size,
         "coarse_method": coarse_method,
+        "lambda_contact": lambda_contact,
+        "feature_mode": feature_mode,
+        "feature_knn_k": feature_knn_k,
+        "embedding_dim": embedding_dim,
+        "hdbscan_min_cluster_size": hdbscan_min_cluster_size,
+        "hdbscan_min_samples": hdbscan_min_samples,
+        "hdbscan_selection_method": hdbscan_selection_method,
+        "contact_postprocess": contact_postprocess,
         "resolution": resolution,
         "refine": refine,
     }
@@ -493,6 +581,14 @@ def run_bam(
                     seed=seed,
                     bam=None,
                     threads=threads,
+                    lambda_contact=lambda_contact,
+                    feature_mode=feature_mode,
+                    feature_knn_k=feature_knn_k,
+                    embedding_dim=embedding_dim,
+                    hdbscan_min_cluster_size=hdbscan_min_cluster_size,
+                    hdbscan_min_samples=hdbscan_min_samples,
+                    hdbscan_selection_method=hdbscan_selection_method,
+                    contact_postprocess=contact_postprocess,
                 )
             else:
                 raise GraphClusterError(f"Unknown --coarse-method {coarse_method!r}. Use 'spectral'.")

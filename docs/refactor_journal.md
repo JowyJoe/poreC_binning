@@ -1181,3 +1181,63 @@ Status: completed
 
 - if live refinement work continues, the next design question should be whether `reassign` and `recruit` remain one-pass or become iterative
 - merge remains lowest priority
+
+
+## Coarse audit instrumentation round 1
+
+### What changed
+
+- kept the active coarse algorithm unchanged at a high level:
+  - joint contact-feature spectral embedding
+  - HDBSCAN
+  - optional contact-component postprocess
+- made coarse-side control knobs explicit in the active spectral entrypoints:
+  - `lambda_contact`
+  - `feature_mode`
+  - `feature_knn_k`
+  - `embedding_dim`
+  - `hdbscan_min_cluster_size`
+  - `hdbscan_min_samples`
+  - `hdbscan_selection_method`
+  - `contact_postprocess`
+- added a first coarse feature ablation mode:
+  - `feature_mode = tnf_only`
+  - existing default remains `tnf_plus_cov`
+- added a coarse postprocess master switch:
+  - `contact_postprocess = True/False`
+  - did not add internal sub-switches for individual postprocess actions
+- extended coarse metadata to make the main risk points observable:
+  - contact component counts / largest-share summary
+  - raw HDBSCAN noise statistics before contact postprocess
+  - coverage missing fraction
+  - contact-feature neighbor overlap summary
+  - whether contact postprocess was enabled
+
+### Files changed
+
+- `porebin/cli.py`
+- `porebin/cluster.py`
+- `porebin/hypergraph_joint_spectral.py`
+- `tests/test_spectral_cluster.py`
+
+### What was not done
+
+- did not change the joint operator formula
+- did not implement adaptive `lambda_contact`
+- did not split contact postprocess into internal sub-switches
+- did not change refine behavior
+
+### Verification
+
+- ran:
+  - `pytest -q tests/test_refine_mvp.py tests/test_scg_qc.py tests/test_spectral_cluster.py tests/test_many_bins_not_limited.py tests/test_joint_operator_shapes.py`
+- result:
+  - `17 passed`
+
+### Next step
+
+- run coarse control experiments on real data:
+  - `lambda_contact` grid
+  - `feature_mode` comparison
+  - `contact_postprocess` on/off
+  - optional HDBSCAN selection-method comparison

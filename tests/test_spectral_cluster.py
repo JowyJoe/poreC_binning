@@ -71,7 +71,7 @@ def test_cluster_spectral_hypergraph_two_components(tmp_path: Path) -> None:
     graph_dir = _write_graph_dir(tmp_path)
     out_bins = tmp_path / "bins.tsv"
 
-    cluster_spectral_hypergraph(graph_dir=graph_dir, out_bins_tsv=out_bins, seed=0)
+    meta = cluster_spectral_hypergraph(graph_dir=graph_dir, out_bins_tsv=out_bins, seed=0)
 
     mapping = {}
     for line in out_bins.read_text(encoding="utf-8").splitlines()[1:]:
@@ -84,3 +84,56 @@ def test_cluster_spectral_hypergraph_two_components(tmp_path: Path) -> None:
     assert len(a_label) == 1
     assert len(c_label) == 1
     assert next(iter(a_label)) != next(iter(c_label))
+    assert meta["feature_mode"] == "tnf_plus_cov"
+    assert meta["contact_postprocess_enabled"] is True
+    assert "hdbscan_raw_noise_fraction" in meta
+    assert "contact_components_total" in meta
+    assert "contact_feature_neighbor_overlap_mean" in meta
+
+
+def test_cluster_spectral_hypergraph_supports_tnf_only_and_no_postprocess(tmp_path: Path) -> None:
+    pytest.importorskip("scipy", reason="spectral optional deps not installed")
+    pytest.importorskip("hdbscan", reason="spectral v2 clustering requires hdbscan")
+    pytest.importorskip("sklearn", reason="spectral v2 clustering requires scikit-learn")
+
+    from porebin.cluster import cluster_spectral_hypergraph
+
+    graph_dir = _write_graph_dir(tmp_path)
+    out_bins = tmp_path / "bins.tsv"
+
+    meta = cluster_spectral_hypergraph(
+        graph_dir=graph_dir,
+        out_bins_tsv=out_bins,
+        seed=0,
+        lambda_contact=0.8,
+        feature_mode="tnf_only",
+        feature_knn_k=3,
+        embedding_dim=4,
+        hdbscan_min_cluster_size=5,
+        hdbscan_min_samples=2,
+        hdbscan_selection_method="leaf",
+        contact_postprocess=False,
+    )
+
+    mapping = {}
+    for line in out_bins.read_text(encoding="utf-8").splitlines()[1:]:
+        contig, bin_id = line.split("\t")
+        mapping[contig] = bin_id
+
+    a_label = {mapping[f"A{i}"] for i in range(5)}
+    c_label = {mapping[f"C{i}"] for i in range(5)}
+    assert len(a_label) == 1
+    assert len(c_label) == 1
+    assert next(iter(a_label)) != next(iter(c_label))
+    assert abs(float(meta["lambda_contact"]) - 0.8) < 1e-12
+    assert abs(float(meta["lambda_feature"]) - 0.2) < 1e-12
+    assert meta["feature_mode"] == "tnf_only"
+    assert meta["knn_k"] == 3
+    assert meta["d"] == 4
+    assert meta["embedding_dim_effective"] == 4
+    assert meta["contact_postprocess_enabled"] is False
+    assert meta["hdbscan"]["min_samples"] == 2
+    assert meta["hdbscan"]["cluster_selection_method"] == "leaf"
+    assert meta["contact_component_postprocess"]["components_promoted_from_noise"] == 0
+    assert meta["contact_component_postprocess"]["noise_reassigned_by_component"] == 0
+    assert meta["contact_component_postprocess"]["labels_split_by_component"] == 0

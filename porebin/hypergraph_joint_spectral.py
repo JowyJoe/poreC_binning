@@ -25,32 +25,18 @@ class ContactComponentPostprocessMeta:
     labels_split_by_component: int
 
 
-def postprocess_labels_by_contact_components(
-    labels: "object",
-    contact_H_csr: "object",
-    *,
-    min_cluster_size: int,
-) -> tuple["object", ContactComponentPostprocessMeta]:
-    """
-    Postprocess HDBSCAN labels using the contact hypergraph connectivity.
+@dataclass(frozen=True)
+class ContactComponentStats:
+    components_total: int
+    largest_component_size: int
+    largest_component_share: float
 
-    Goals:
-      1) Prevent a single bin/label from spanning multiple disconnected contact components.
-      2) If HDBSCAN marks vertices as noise (-1) inside a contact-connected component that otherwise has an assigned label,
-         reassign those noise vertices to the component's majority non-noise label.
-      3) If an entire contact-connected component is noise but its size >= min_cluster_size, promote it to a new label.
 
-    This does not construct a dense |V|x|V| matrix and only uses hyperedge membership for connectivity.
-    """
+def _contact_component_members(contact_H_csr: "object") -> list[list[int]]:
     import numpy as np
 
-    labels = np.asarray(labels, dtype=int).copy()
     H = contact_H_csr
     V = int(H.shape[0])
-    if labels.shape[0] != V:
-        raise JointSpectralError("Internal error: labels length mismatch in contact-component postprocess.")
-
-    # Build contact-connected components via union-find over hyperedges.
     Hcsc = H.tocsc()
     parent = np.arange(V, dtype=np.int32)
 
@@ -80,18 +66,63 @@ def postprocess_labels_by_contact_components(
 
     roots = np.asarray([find(i) for i in range(V)], dtype=np.int32)
     uniq_roots, inv = np.unique(roots, return_inverse=True)
-    comp_id = inv  # 0..C-1
-    num_components = int(uniq_roots.shape[0])
+    comp_members: list[list[int]] = [[] for _ in range(int(uniq_roots.shape[0]))]
+    for v in range(V):
+        comp_members[int(inv[v])].append(v)
+    return comp_members
+
+
+def summarize_contact_components(contact_H_csr: "object") -> ContactComponentStats:
+    comp_members = _contact_component_members(contact_H_csr)
+    V = int(contact_H_csr.shape[0])
+    components_total = len(comp_members)
+    largest_component_size = max((len(m) for m in comp_members), default=0)
+    largest_component_share = float(largest_component_size / V) if V > 0 else 0.0
+    return ContactComponentStats(
+        components_total=int(components_total),
+        largest_component_size=int(largest_component_size),
+        largest_component_share=float(largest_component_share),
+    )
+
+
+def postprocess_labels_by_contact_components(
+    labels: "object",
+    contact_H_csr: "object",
+    *,
+    min_cluster_size: int,
+) -> tuple["object", ContactComponentPostprocessMeta]:
+    """
+    Postprocess HDBSCAN labels using the contact hypergraph connectivity.
+
+    Goals:
+      1) Prevent a single bin/label from spanning multiple disconnected contact components.
+      2) If HDBSCAN marks vertices as noise (-1) inside a contact-connected component that otherwise has an assigned label,
+         reassign those noise vertices to the component's majority non-noise label.
+      3) If an entire contact-connected component is noise but its size >= min_cluster_size, promote it to a new label.
+
+    This does not construct a dense |V|x|V| matrix and only uses hyperedge membership for connectivity.
+    """
+    import numpy as np
+
+    labels = np.asarray(labels, dtype=int).copy()
+    H = contact_H_csr
+    V = int(H.shape[0])
+    if labels.shape[0] != V:
+        raise JointSpectralError("Internal error: labels length mismatch in contact-component postprocess.")
+
+    # Build contact-connected components via union-find over hyperedges.
+    comp_members = _contact_component_members(contact_H_csr)
+    num_components = int(len(comp_members))
+    comp_id = np.empty((V,), dtype=np.int32)
+    for cid, members in enumerate(comp_members):
+        for v in members:
+            comp_id[int(v)] = int(cid)
 
     promoted = 0
     reassigned = 0
 
     # Per-component majority non-noise label (if any)
     # (Component ids are 0..C-1, small; use python lists for speed.)
-    comp_members: list[list[int]] = [[] for _ in range(num_components)]
-    for v in range(V):
-        comp_members[int(comp_id[v])].append(v)
-
     next_label = int(labels.max(initial=-1)) + 1
     for cid in range(num_components):
         members = comp_members[cid]
@@ -743,7 +774,14 @@ def spectral_embed_joint(
     return Z
 
 
-def hdbscan_cluster(Z: "object", *, min_cluster_size: int, threads: int) -> tuple["object", dict]:
+def hdbscan_cluster(
+    Z: "object",
+    *,
+    min_cluster_size: int,
+    min_samples: Optional[int],
+    selection_method: str,
+    threads: int,
+) -> tuple["object", dict]:
     """
     Cluster embedding with HDBSCAN.
     Returns (labels, meta)
@@ -763,11 +801,16 @@ def hdbscan_cluster(Z: "object", *, min_cluster_size: int, threads: int) -> tupl
 
     # Use leaf selection to avoid artificially limiting the number of clusters in coarse binning.
     # This is still fully unsupervised (no fixed K) and works well for many small bins.
+    selection_method = str(selection_method).strip().lower()
+    if selection_method not in {"leaf", "eom"}:
+        raise JointSpectralError(
+            f"hdbscan cluster_selection_method must be 'leaf' or 'eom', got {selection_method!r}."
+        )
     kwargs = {
         "min_cluster_size": int(min_cluster_size),
-        "min_samples": None,
+        "min_samples": (None if min_samples is None else int(min_samples)),
         "metric": "euclidean",
-        "cluster_selection_method": "leaf",
+        "cluster_selection_method": selection_method,
     }
     # hdbscan supports parallelization via core_dist_n_jobs
     if int(threads) > 1:
