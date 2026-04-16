@@ -99,6 +99,7 @@ def resolve_scg_resources(db_dir: Optional[Path] = None) -> ScgResources:
 
     if not marker_hmm.exists():
         raise ScgError(f"SCG marker HMM missing: {marker_hmm}")
+    _validate_hmm_file(marker_hmm)
 
     expected_markers = tuple(str(x).strip() for x in manifest.get("expected_markers", []) if str(x).strip())
     return ScgResources(
@@ -109,6 +110,52 @@ def resolve_scg_resources(db_dir: Optional[Path] = None) -> ScgResources:
         db_version=(str(manifest.get("db_version")).strip() if manifest.get("db_version") is not None else None),
         expected_markers=expected_markers,
     )
+
+
+def _validate_hmm_file(path: Path) -> None:
+    """Perform a lightweight structural check before invoking hmmsearch."""
+    headers = 0
+    terminators = 0
+    in_model = False
+    first_nonempty = ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for lineno, raw in enumerate(fh, 1):
+                line = raw.rstrip("\n\r")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not first_nonempty:
+                    first_nonempty = stripped
+                if line.startswith("HMMER"):
+                    if in_model:
+                        raise ScgError(
+                            f"Invalid HMM file {path}: model starting at line {lineno} appears before previous model terminator."
+                        )
+                    headers += 1
+                    in_model = True
+                elif stripped == "//":
+                    if not in_model:
+                        raise ScgError(
+                            f"Invalid HMM file {path}: extra model terminator at line {lineno}."
+                        )
+                    terminators += 1
+                    in_model = False
+    except OSError as exc:
+        raise ScgError(f"Could not read SCG marker HMM: {path}") from exc
+
+    if not first_nonempty:
+        raise ScgError(f"Invalid HMM file {path}: file is empty.")
+    if not first_nonempty.startswith("HMMER"):
+        raise ScgError(f"Invalid HMM file {path}: first non-empty line is not an HMMER header.")
+    if headers == 0:
+        raise ScgError(f"Invalid HMM file {path}: no HMMER model headers found.")
+    if in_model:
+        raise ScgError(f"Invalid HMM file {path}: final model is missing a // terminator.")
+    if headers != terminators:
+        raise ScgError(
+            f"Invalid HMM file {path}: HMMER model headers ({headers}) do not match terminators ({terminators})."
+        )
 
 
 def ensure_scg_hits(

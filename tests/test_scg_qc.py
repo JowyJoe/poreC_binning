@@ -64,6 +64,24 @@ def test_ensure_scg_hits_reuses_cache_and_keeps_expected_markers(tmp_path: Path)
     assert result.resources.marker_hmm.name == "core_bacterial_scg.hmm"
 
 
+def test_resolve_scg_resources_rejects_extra_hmm_terminator(tmp_path: Path) -> None:
+    from porebin.scg import ScgError, resolve_scg_resources
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    (db_dir / "core_bacterial_scg.hmm").write_text("HMMER3/f\nNAME  SCG_A\n//\n//\n", encoding="utf-8")
+    (db_dir / "manifest.json").write_text(
+        (
+            '{"marker_set_id":"test_scg","db_version":"0.1","marker_hmm":"core_bacterial_scg.hmm",'
+            '"expected_markers":["SCG_A"]}'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ScgError, match="extra model terminator"):
+        resolve_scg_resources(db_dir=db_dir)
+
+
 def test_ensure_scg_hits_cached_without_resources_is_partial(tmp_path: Path) -> None:
     from porebin.scg import ensure_scg_hits
 
