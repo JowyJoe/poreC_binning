@@ -5,16 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "porebin"
 version = "0.1.0"
-description = "Hypergraph-preserving metagenome binning from Nanopore Pore-C multi-way contacts"
+description = "Genome-centric Pore-C metagenomic binning with contact evidence, sequence composition, and coverage"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "porebin contributors" }]
 dependencies = [
   "typer>=0.12",
-  "rich>=13.7",
   "pyarrow>=14.0",
-  "python-igraph>=0.11.4",
-  "leidenalg>=0.10.2",
 ]
 
 [project.optional-dependencies]
@@ -31,10 +28,8 @@ spectral = [
 ]
 
 [project.scripts]
-porebin = "porebin.cli:app"
+porebin = "porebin_genome.cli:app"
+porebin-genome = "porebin_genome.cli:app"
 
 [tool.setuptools.packages.find]
-include = ["porebin*"]
-
-[tool.setuptools.package-data]
-porebin = ["scg_db/*.json", "scg_db/*.hmm", "scg_db/*.tsv", "scg_db/*.txt"]
+include = ["porebin_genome*"]

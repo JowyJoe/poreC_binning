@@ -1,104 +1,103 @@
-# porebin (v0.1.0)
+# porebin
 
-Host-centric, hypergraph-preserving metagenome binning from Nanopore Pore-C multi-way contacts.
-
-Core idea:
-
-- treat each multi-way contact as one hyperedge
-- preserve the hyperedge structure without clique expansion in the main method
-- combine contact hypergraph signal and feature hypergraph signal for coarse clustering
-- run a refine stage that performs host-assignment inference on top of coarse candidate host communities
+`porebin` is a genome-centric Pore-C metagenomic binning tool. It combines Pore-C contact evidence, sequence composition, and coverage to discover candidate genome bins, refine them into final genome bins, and keep unresolved contigs explicit.
 
 ## Install
 
 ```bash
-pip install -e ".[bam,spectral]"
+pip install -e ".[bam,spectral,dev]"
 ```
 
-Key dependencies:
-
-- required: `pyarrow`, `python-igraph`, `leidenalg`, `typer`, `rich`
-- BAM path: `pysam`
-- spectral coarse clustering: `scipy`, `scikit-learn`, `hdbscan`
-
-### Conda install
+### Conda environment
 
 ```bash
 conda env create -f environment.yml
-conda activate porebin
+conda activate porebin-genome
 pip install -e . --no-deps
 ```
 
-If you use the Conda environment for the main spectral pipeline, `scikit-learn` and `hdbscan`
-must also be present. The checked-in `environment.yml` now includes them.
+## Public CLI
 
-## Documentation
+- `porebin evidence`: build canonical `contacts.parquet` and `coverage.tsv` from a queryname-sorted BAM
+- `porebin bin`: run coarse candidate genome-bin discovery and genome-bin refinement
+- `porebin export`: export final genome bins and unresolved contigs as FASTA
 
-- Current architecture, math, interfaces, and legacy paths:
-  [`docs/PROJECT_REFERENCE.md`](docs/PROJECT_REFERENCE.md)
-- Short context/status note:
-  [`docs/CONTEXT.md`](docs/CONTEXT.md)
+The public binning contract is:
 
-`docs/PROJECT_REFERENCE.md` is the current source-of-truth document for repository structure and behavior.
-
-## Commands
-
-- `porebin run-bam`: end-to-end BAM pipeline. Add `--pairwise-baseline` for the clique-expansion control.
-- `porebin bam2contacts`: convert a name-sorted BAM into `contacts.parquet` and `coverage.tsv`.
-- `porebin build`: write graph audit artifacts from `contacts.parquet`.
-- `porebin cluster`: run coarse clustering (`spectral` is the active method).
-- `porebin refine`: run host-assignment inference from `contacts.parquet` and coarse `bins.tsv`.
-- `porebin export`: export FASTA bins and `unbinned.fasta`.
-
-All commands write `out_dir/run.json`. `porebin refine` also writes `out_dir/run_refine.json`.
+```text
+contigs.fasta + contacts.parquet + coverage.tsv
+  -> coarse/bins.tsv
+  -> coarse/run.json
+  -> final/bins.refined.tsv
+  -> final/unbinned.tsv
+  -> final/bin_qc.tsv
+  -> final/refine_actions.tsv
+  -> final/refine_meta.json
+```
 
 ## Recommended workflow
 
 ```bash
-# upstream example:
-# minimap2 ... | samtools sort -n -o reads.namesorted.bam
+# build evidence from a queryname-sorted BAM
+porebin evidence \
+  --bam reads.namesorted.bam \
+  --contigs contigs.fasta \
+  --out run_out
 
-porebin run-bam --bam reads.namesorted.bam --contigs contigs.fasta --out out_bam --seed 0
-porebin export --contigs contigs.fasta --bins-tsv out_bam/refined/bins.refined.tsv --out out_bam/final_bins
+# run coarse discovery + refine MVP
+porebin bin \
+  --contigs contigs.fasta \
+  --contacts run_out/evidence/contacts.parquet \
+  --coverage-tsv run_out/evidence/coverage.tsv \
+  --out run_out
+
+# export final bins and unresolved contigs
+porebin export \
+  --contigs contigs.fasta \
+  --bins-refined-tsv run_out/final/bins.refined.tsv \
+  --unbinned-tsv run_out/final/unbinned.tsv \
+  --out export_out
 ```
 
-Pairwise baseline:
+## Output semantics
 
-```bash
-porebin run-bam --pairwise-baseline --bam reads.namesorted.bam --contigs contigs.fasta --out out_pw --seed 0
-porebin export --contigs contigs.fasta --bins-tsv out_pw/bins.tsv --out out_pw/final_bins
-```
+### `coarse/bins.tsv`
 
-## Input summary
+Candidate genome bins from the coarse discovery stage. These are not final bins.
 
-### Name-sorted BAM
+### `final/bins.refined.tsv`
 
-The main BAM path assumes one read name equals one hyperedge.
+Final genome-bin assignments with:
 
-```bash
-samtools sort -n -o reads.namesorted.bam reads.bam
-```
+- `contig_id`
+- `bin_id`
+- `assignment_stage`
+- `assignment_confidence`
+- `assignment_reason`
 
-### contacts.parquet
+### `final/unbinned.tsv`
 
-`contacts.parquet` is the evidence-layer source of truth in the current pipeline.
+Contigs that remain unresolved after refinement, with explicit stage and reason.
 
-The detailed schema and semantics are documented in:
+### `final/bin_qc.tsv`
 
-- [`docs/PROJECT_REFERENCE.md`](docs/PROJECT_REFERENCE.md)
+Bin-level refine summary including contig count, total length, median coverage, contact consistency, suspect flag, and refine status.
 
-Important fields include:
+### `final/refine_actions.tsv`
 
-- `contigs`
-- `contig_weights`
-- `k`
-- `k_eff`
-- `weight`
-- BAM/QC evidence columns
+Accepted and rejected refine actions for split, reassign, recruit, and filter.
 
-## Notes
+### `final/refine_meta.json`
 
-- Main coarse path: joint hypergraph spectral embedding + HDBSCAN
-- Main refine path: parquet-based host-assignment inference with soft gating
-- Pairwise baseline is a control path, not the main method
-- Historical and legacy paths still exist in the repository and are documented in `docs/PROJECT_REFERENCE.md`
+Stage-level counts for suspect bins, split/reassign/recruit candidates, accepted actions, rejected actions, and final unbinned contigs.
+
+## Method boundaries
+
+- coarse discovery does not promote HDBSCAN noise into bins by component-majority postprocessing
+- refine is genome-centric and does not use host-centric semantics
+- unresolved contigs remain explicit instead of being forced into bins
+- SCG is not a hard dependency in the current mainline
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
