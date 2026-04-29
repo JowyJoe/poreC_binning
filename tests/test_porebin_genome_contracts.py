@@ -50,7 +50,7 @@ def test_porebin_genome_contract_validators(tmp_path: Path) -> None:
     assert all("host" not in column.lower() for column in COARSE_BINS_COLUMNS)
 
     refined_bins = tmp_path / "bins.refined.tsv"
-    write_tsv_rows(refined_bins, FINAL_BINS_COLUMNS, [("c1", "0", "coarse_keep", 0.9, "coarse_assignment_retained")])
+    write_tsv_rows(refined_bins, FINAL_BINS_COLUMNS, [("c1", "0", "coarse_keep", "coarse_assignment_retained")])
     validate_tsv_header(refined_bins, FINAL_BINS_COLUMNS)
     assert all("host" not in column.lower() for column in FINAL_BINS_COLUMNS)
 
@@ -64,11 +64,11 @@ def test_porebin_genome_contract_validators(tmp_path: Path) -> None:
     assert all("host" not in column.lower() for column in UNBINNED_COLUMNS)
 
     bin_qc = tmp_path / "bin_qc.tsv"
-    write_tsv_rows(bin_qc, BIN_QC_COLUMNS, [("0", 1, 1000, "10", "0.95", 0, "stable", "stable_after_refine")])
+    write_tsv_rows(bin_qc, BIN_QC_COLUMNS, [("0", 1, 1000, "10", "0.95", "scg_clean", 0, 0, "stable", "stable_after_refine")])
     validate_tsv_header(bin_qc, BIN_QC_COLUMNS)
     assert all("host" not in column.lower() for column in BIN_QC_COLUMNS)
 
     refine_actions = tmp_path / "refine_actions.tsv"
-    write_tsv_rows(refine_actions, REFINE_ACTIONS_COLUMNS, [("reassign", "c1", "", "0", "1", "move_to_target_bin", 1, 0.9, "accepted")])
+    write_tsv_rows(refine_actions, REFINE_ACTIONS_COLUMNS, [("reassign", "c1", "", "0", "1", "move_to_target_bin", 1, 0.9, 0.2, "abstain", "accepted")])
     validate_tsv_header(refine_actions, REFINE_ACTIONS_COLUMNS)
     assert all("host" not in column.lower() for column in REFINE_ACTIONS_COLUMNS)

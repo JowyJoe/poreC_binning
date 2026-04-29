@@ -377,6 +377,64 @@ def write_reassign_refine_fixture(tmp_path: Path) -> dict[str, Path]:
     )
 
 
+def write_merge_refine_fixture(tmp_path: Path) -> dict[str, Path]:
+    seq_shared = ("AAAACCCCGGGGTTTT" * 150)
+    contigs = {
+        "a": seq_shared,
+        "b": seq_shared,
+        "c": seq_shared,
+        "d": seq_shared,
+    }
+    coverage = {"a": 20.0, "b": 20.0, "c": 20.0, "d": 20.0}
+    coarse = {"a": "0", "b": "0", "c": "1", "d": "1"}
+    rows: list[dict[str, object]] = []
+    contact_id = 0
+    for _ in range(30):
+        rows.append(
+            {
+                "contact_id": contact_id,
+                "contigs": ["a", "b"],
+                "contig_weights": [0.5, 0.5],
+                "k": 2,
+                "k_eff": 2.0,
+                "weight": 1.0,
+            }
+        )
+        contact_id += 1
+    for _ in range(30):
+        rows.append(
+            {
+                "contact_id": contact_id,
+                "contigs": ["c", "d"],
+                "contig_weights": [0.5, 0.5],
+                "k": 2,
+                "k_eff": 2.0,
+                "weight": 1.0,
+            }
+        )
+        contact_id += 1
+    for pair in (("a", "c"), ("a", "d"), ("b", "c"), ("b", "d")):
+        for _ in range(25):
+            rows.append(
+                {
+                    "contact_id": contact_id,
+                    "contigs": [pair[0], pair[1]],
+                    "contig_weights": [0.5, 0.5],
+                    "k": 2,
+                    "k_eff": 2.0,
+                    "weight": 1.0,
+                }
+            )
+            contact_id += 1
+    return write_generic_refine_fixture(
+        tmp_path,
+        contig_sequences=contigs,
+        coverage_by_contig=coverage,
+        coarse_assignment=coarse,
+        contacts_rows=rows,
+    )
+
+
 def write_ambiguous_refine_fixture(tmp_path: Path) -> dict[str, Path]:
     seq_zero = ("AAAACCCCGGGGTTTT" * 150)
     seq_one = ("ATATATATCGCGCGCG" * 150)

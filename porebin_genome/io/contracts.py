@@ -29,7 +29,6 @@ FINAL_BINS_COLUMNS = (
     "contig_id",
     "bin_id",
     "assignment_stage",
-    "assignment_confidence",
     "assignment_reason",
 )
 
@@ -46,7 +45,9 @@ BIN_QC_COLUMNS = (
     "n_contigs",
     "total_length",
     "median_coverage",
-    "contact_consistency",
+    "contact_coherence",
+    "scg_status",
+    "scg_duplicate_marker_count",
     "suspect_flag",
     "refine_status",
     "notes",
@@ -61,6 +62,8 @@ REFINE_ACTIONS_COLUMNS = (
     "reason",
     "accepted",
     "confidence",
+    "delta_contact",
+    "scg_status",
     "note",
 )
 

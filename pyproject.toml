@@ -21,6 +21,10 @@ dev = [
 bam = [
   "pysam>=0.22",
 ]
+refine = [
+  "igraph>=1.0",
+  "leidenalg>=0.11",
+]
 spectral = [
   "scipy>=1.10",
   "scikit-learn>=1.2",

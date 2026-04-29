@@ -15,6 +15,16 @@ def bin_command(
     contigs: Path = typer.Option(..., "--contigs", help="Contigs FASTA file."),
     contacts: Path = typer.Option(..., "--contacts", help="Canonical contacts.parquet evidence file."),
     coverage_tsv: Path = typer.Option(..., "--coverage-tsv", help="Coverage table used in the default genome-binning contract."),
+    disable_scg: bool = typer.Option(
+        False,
+        "--disable-scg",
+        help="Disable internal SCG veto. By default refine requires external `prodigal` and `hmmsearch`.",
+    ),
+    scg_hmm: Path | None = typer.Option(
+        None,
+        "--scg-hmm",
+        help="Optional override for the bundled bacterial core SCG HMM database.",
+    ),
     out: Path = typer.Option(..., "--out", help="Output directory."),
 ) -> None:
     """Run coarse candidate-bin discovery followed by the genome-centric refine MVP."""
@@ -23,6 +33,8 @@ def bin_command(
         "contigs": str(contigs),
         "contacts": str(contacts),
         "coverage_tsv": str(coverage_tsv),
+        "disable_scg": bool(disable_scg),
+        "scg_hmm": (str(scg_hmm) if scg_hmm is not None else None),
         "out": str(out),
     }
     with record_run(out, command="bin", params=params) as run_record:
@@ -37,6 +49,8 @@ def bin_command(
             coarse_bins_tsv=coarse_result.bins_tsv,
             contacts_parquet=contacts,
             coverage_tsv=coverage_tsv,
+            enable_scg=(not disable_scg),
+            scg_hmm_path=scg_hmm,
             out_dir=out,
         )
         run_record["outputs"] = {

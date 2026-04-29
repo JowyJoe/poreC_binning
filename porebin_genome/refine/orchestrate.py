@@ -18,24 +18,23 @@ from porebin_genome.io.fasta import read_contig_lengths
 from porebin_genome.io.runtime import ensure_dir, write_json
 from porebin_genome.io.tables import read_assignment_tsv, write_tsv_rows
 from porebin_genome.refine.actions import write_refine_actions_tsv
+from porebin_genome.refine.features import (
+    build_bin_feature_profiles,
+    load_refine_feature_inputs,
+)
+from porebin_genome.refine.hyperedge import default_edge_reliability, load_hyperedges
+from porebin_genome.refine.markers import prepare_scg_profiles
+from porebin_genome.refine.merge import apply_merge_decision, evaluate_merge_candidate, generate_merge_candidates
 from porebin_genome.refine.models import RefineActionRow, RefineState, RefinedAssignmentRow, UnbinnedRow
 from porebin_genome.refine.qc import build_bin_qc_rows, write_bin_qc_tsv
 from porebin_genome.refine.reassign import (
     apply_reassign_decision,
     evaluate_reassign_candidate,
-    filter_low_confidence_assignments,
     generate_reassign_candidates,
 )
 from porebin_genome.refine.recruit import apply_recruit_decision, evaluate_recruit_candidate, generate_recruit_candidates
 from porebin_genome.refine.split import apply_split_decision, evaluate_split_candidate, generate_split_candidates
 from porebin_genome.refine.suspect import build_bin_snapshots, detect_suspect_bins
-from porebin_genome.refine.support import (
-    build_bin_feature_profiles,
-    compute_assignment_confidence,
-    evaluate_feature_gate,
-    load_refine_feature_inputs,
-    scan_bin_support,
-)
 
 
 @dataclass(frozen=True)
@@ -57,6 +56,10 @@ def run_refinement(
     contacts_parquet: Path,
     coverage_tsv: Path,
     out_dir: Path,
+    enable_scg: bool = True,
+    scg_hmm_path: Path | None = None,
+    prodigal_executable: str = "prodigal",
+    hmmsearch_executable: str = "hmmsearch",
     logger: Optional[object] = None,
 ) -> RefineRunResult:
     """Run the genome-centric refine MVP."""
@@ -76,10 +79,23 @@ def run_refinement(
 
     coarse_assignment_all = read_assignment_tsv(coarse_bins_tsv, expected_header=COARSE_BINS_COLUMNS)
     contig_lengths = read_contig_lengths(contigs_fasta)
+    hyperedges = load_hyperedges(contacts_parquet)
+    reliability_fn = default_edge_reliability
     feature_matrix, contig_name_to_idx, _idx_to_name, coverage_by_contig = load_refine_feature_inputs(
         contigs_fasta=contigs_fasta,
         coverage_tsv=coverage_tsv,
     )
+    scg_result = None
+    contig_scg_profiles = {}
+    if enable_scg:
+        scg_result = prepare_scg_profiles(
+            contigs_fasta=contigs_fasta,
+            out_dir=layout.evidence_dir / "scg",
+            scg_hmm_path=scg_hmm_path,
+            prodigal_executable=prodigal_executable,
+            hmmsearch_executable=hmmsearch_executable,
+        )
+        contig_scg_profiles = scg_result.contig_profiles
 
     current_assignment = {
         contig_id: str(bin_id)
@@ -109,33 +125,40 @@ def run_refinement(
     n_bins_in = len(state.bin_to_contigs())
     action_rows: list[RefineActionRow] = []
 
-    support_summary = scan_bin_support(contacts_parquet=contacts_parquet, state=state)
     profiles = build_bin_feature_profiles(
         state=state,
         feature_matrix=feature_matrix,
         contig_name_to_idx=contig_name_to_idx,
     )
-    snapshots = build_bin_snapshots(state=state, support_summary=support_summary, profiles=profiles)
+    snapshots = build_bin_snapshots(
+        state=state,
+        store=hyperedges,
+        profiles=profiles,
+        reliability_fn=reliability_fn,
+        contig_scg_profiles=contig_scg_profiles if enable_scg else None,
+    )
     suspects = detect_suspect_bins(snapshots=snapshots)
 
     split_candidates = generate_split_candidates(
         state=state,
         suspects=suspects,
-        support_summary=support_summary,
+        store=hyperedges,
         feature_matrix=feature_matrix,
         contig_name_to_idx=contig_name_to_idx,
+        reliability_fn=reliability_fn,
     )
     n_split_applied = 0
     for candidate in split_candidates:
-        snapshot = snapshots[candidate.source_bin]
         decision = evaluate_split_candidate(
             candidate=candidate,
             state=state,
-            snapshot=snapshot,
-            support_summary=support_summary,
+            store=hyperedges,
             feature_matrix=feature_matrix,
             contig_name_to_idx=contig_name_to_idx,
+            profiles=profiles,
             new_bin_id=state.allocate_bin_id(),
+            reliability_fn=reliability_fn,
+            contig_scg_profiles=contig_scg_profiles if enable_scg else None,
         )
         action_rows.append(
             RefineActionRow(
@@ -147,6 +170,12 @@ def run_refinement(
                 reason=decision.reason,
                 accepted=decision.accepted,
                 confidence=float(decision.confidence),
+                delta_contact=_extract_delta_contact(decision.note),
+                scg_status=_extract_scg_status(
+                    reason=decision.reason,
+                    note=decision.note,
+                    scg_enabled=enable_scg,
+                ),
                 note=decision.note,
             )
         )
@@ -154,7 +183,6 @@ def run_refinement(
             apply_split_decision(state=state, decision=decision)
             n_split_applied += 1
 
-    support_summary = scan_bin_support(contacts_parquet=contacts_parquet, state=state)
     profiles = build_bin_feature_profiles(
         state=state,
         feature_matrix=feature_matrix,
@@ -163,14 +191,25 @@ def run_refinement(
 
     reassign_candidates = generate_reassign_candidates(
         state=state,
-        support_summary=support_summary,
+        store=hyperedges,
         profiles=profiles,
         feature_matrix=feature_matrix,
         contig_name_to_idx=contig_name_to_idx,
+        reliability_fn=reliability_fn,
     )
     n_reassigned = 0
+    n_reassign_abstained = 0
     for candidate in reassign_candidates:
-        decision = evaluate_reassign_candidate(candidate)
+        decision = evaluate_reassign_candidate(
+            candidate=candidate,
+            state=state,
+            store=hyperedges,
+            profiles=profiles,
+            feature_matrix=feature_matrix,
+            contig_name_to_idx=contig_name_to_idx,
+            reliability_fn=reliability_fn,
+            contig_scg_profiles=contig_scg_profiles if enable_scg else None,
+        )
         action_rows.append(
             RefineActionRow(
                 action_type="reassign",
@@ -181,49 +220,89 @@ def run_refinement(
                 reason=decision.reason,
                 accepted=decision.accepted,
                 confidence=float(decision.confidence),
+                delta_contact=_extract_delta_contact(decision.note),
+                scg_status=_extract_scg_status(
+                    reason=decision.reason,
+                    note=decision.note,
+                    scg_enabled=enable_scg,
+                ),
                 note=decision.note,
             )
         )
+        before_assigned = candidate.contig_id in state.current_assignment
+        apply_reassign_decision(state=state, decision=decision)
+        after_assigned = candidate.contig_id in state.current_assignment
         if decision.accepted:
-            apply_reassign_decision(state=state, decision=decision)
             n_reassigned += 1
+        elif before_assigned and not after_assigned:
+            n_reassign_abstained += 1
+            action_rows.append(
+                RefineActionRow(
+                    action_type="abstain",
+                    contig_id=candidate.contig_id,
+                    bin_id="",
+                    source_bin=candidate.source_bin,
+                    target_bin="",
+                    reason=decision.reason,
+                    accepted=True,
+                    confidence=float(decision.confidence),
+                    delta_contact=_extract_delta_contact(decision.note),
+                    scg_status=_extract_scg_status(
+                        reason=decision.reason,
+                        note=decision.note,
+                        scg_enabled=enable_scg,
+                    ),
+                    note=decision.note,
+                )
+            )
 
-    support_summary = scan_bin_support(contacts_parquet=contacts_parquet, state=state)
     profiles = build_bin_feature_profiles(
         state=state,
         feature_matrix=feature_matrix,
         contig_name_to_idx=contig_name_to_idx,
     )
-    filtered = filter_low_confidence_assignments(
+
+    merge_candidates = generate_merge_candidates(
         state=state,
-        support_summary=support_summary,
+        store=hyperedges,
         profiles=profiles,
-        feature_matrix=feature_matrix,
-        contig_name_to_idx=contig_name_to_idx,
+        reliability_fn=reliability_fn,
     )
-    for contig_id, source_bin, confidence, note in filtered:
-        state.unassign(
-            contig_id,
-            stage="filter",
-            reason="assignment_confidence_below_threshold",
-            source_bin=source_bin,
-            note=note,
+    n_merged = 0
+    for candidate in merge_candidates:
+        decision = evaluate_merge_candidate(
+            candidate=candidate,
+            state=state,
+            store=hyperedges,
+            profiles=profiles,
+            feature_matrix=feature_matrix,
+            contig_name_to_idx=contig_name_to_idx,
+            reliability_fn=reliability_fn,
+            contig_scg_profiles=contig_scg_profiles if enable_scg else None,
         )
         action_rows.append(
             RefineActionRow(
-                action_type="filter",
-                contig_id=contig_id,
-                bin_id="",
-                source_bin=source_bin,
-                target_bin="",
-                reason="move_to_unbinned",
-                accepted=True,
-                confidence=float(confidence),
-                note=note,
+                action_type="merge",
+                contig_id="",
+                bin_id=candidate.source_bin,
+                source_bin=candidate.target_bin,
+                target_bin=candidate.source_bin,
+                reason=decision.reason,
+                accepted=decision.accepted,
+                confidence=float(decision.confidence),
+                delta_contact=_extract_delta_contact(decision.note),
+                scg_status=_extract_scg_status(
+                    reason=decision.reason,
+                    note=decision.note,
+                    scg_enabled=enable_scg,
+                ),
+                note=decision.note,
             )
         )
+        if decision.accepted:
+            apply_merge_decision(state=state, decision=decision)
+            n_merged += 1
 
-    support_summary = scan_bin_support(contacts_parquet=contacts_parquet, state=state)
     profiles = build_bin_feature_profiles(
         state=state,
         feature_matrix=feature_matrix,
@@ -232,14 +311,21 @@ def run_refinement(
 
     recruit_candidates = generate_recruit_candidates(
         state=state,
-        support_summary=support_summary,
+        store=hyperedges,
         profiles=profiles,
         feature_matrix=feature_matrix,
         contig_name_to_idx=contig_name_to_idx,
+        reliability_fn=reliability_fn,
     )
     n_recruited = 0
     for candidate in recruit_candidates:
-        decision = evaluate_recruit_candidate(candidate)
+        decision = evaluate_recruit_candidate(
+            candidate=candidate,
+            state=state,
+            store=hyperedges,
+            reliability_fn=reliability_fn,
+            contig_scg_profiles=contig_scg_profiles if enable_scg else None,
+        )
         action_rows.append(
             RefineActionRow(
                 action_type="recruit",
@@ -250,6 +336,12 @@ def run_refinement(
                 reason=decision.reason,
                 accepted=decision.accepted,
                 confidence=float(decision.confidence),
+                delta_contact=_extract_delta_contact(decision.note),
+                scg_status=_extract_scg_status(
+                    reason=decision.reason,
+                    note=decision.note,
+                    scg_enabled=enable_scg,
+                ),
                 note=decision.note,
             )
         )
@@ -265,7 +357,6 @@ def run_refinement(
                 note=decision.note,
             )
 
-    final_support = scan_bin_support(contacts_parquet=contacts_parquet, state=state)
     final_profiles = build_bin_feature_profiles(
         state=state,
         feature_matrix=feature_matrix,
@@ -273,17 +364,13 @@ def run_refinement(
     )
     final_snapshots = build_bin_snapshots(
         state=state,
-        support_summary=final_support,
+        store=hyperedges,
         profiles=final_profiles,
+        reliability_fn=reliability_fn,
+        contig_scg_profiles=contig_scg_profiles if enable_scg else None,
     )
 
-    refined_rows = _build_refined_assignment_rows(
-        state=state,
-        support_summary=final_support,
-        profiles=final_profiles,
-        feature_matrix=feature_matrix,
-        contig_name_to_idx=contig_name_to_idx,
-    )
+    refined_rows = _build_refined_assignment_rows(state=state)
     unbinned_rows = _build_unbinned_rows(state=state)
     bin_qc_rows = build_bin_qc_rows(snapshots=final_snapshots)
 
@@ -295,7 +382,6 @@ def run_refinement(
                 row.contig_id,
                 row.bin_id,
                 row.assignment_stage,
-                f"{float(row.assignment_confidence):.6g}",
                 row.assignment_reason,
             )
             for row in refined_rows
@@ -333,6 +419,7 @@ def run_refinement(
             "unbinned_tsv": str(layout.unbinned_tsv),
             "bin_qc_tsv": str(layout.bin_qc_tsv),
             "refine_actions_tsv": str(layout.refine_actions_tsv),
+            "scg_dir": (str(scg_result.scg_dir) if scg_result is not None else None),
         },
         "n_bins_in": int(n_bins_in),
         "n_bins_out": int(len(final_snapshots)),
@@ -341,16 +428,27 @@ def run_refinement(
         "n_split_applied": int(n_split_applied),
         "n_reassign_candidates": int(len(reassign_candidates)),
         "n_reassigned": int(n_reassigned),
+        "n_reassign_abstained": int(n_reassign_abstained),
+        "n_merge_candidates": int(len(merge_candidates)),
+        "n_merged": int(n_merged),
         "n_recruit_candidates": int(len(recruit_candidates)),
         "n_recruited": int(n_recruited),
         "n_unbinned_final": int(len(unbinned_rows)),
+        "n_scg_profiled_contigs": int(len(contig_scg_profiles)),
+        "n_bins_with_duplicate_scg": int(
+            sum(1 for snapshot in final_snapshots.values() if int(snapshot.scg_duplicate_marker_count) > 0)
+        ),
+        "n_scg_veto_actions": int(sum(1 for row in action_rows if row.scg_status == "veto")),
         "n_actions_accepted": int(sum(1 for row in action_rows if row.accepted)),
         "n_actions_rejected": int(sum(1 for row in action_rows if not row.accepted)),
         "notes": {
             "refine_goal": "improve genome-bin purity and control contamination risk",
-            "assignment_confidence_formula": "0.45*target_bin_support_share + 0.35*runner_up_margin + 0.20*feature_gate",
-            "reassign_semantics": "move_to_target_bin_only",
-            "abstention_policy": "retain_low_confidence_or_ambiguous_contigs_as_unbinned",
+            "reassign_semantics": "move_to_target_bin_or_abstain_to_unbinned",
+            "abstention_policy": "boundary contigs with no positive contact-gain move may remain or move to unbinned",
+            "scg_enabled": bool(enable_scg),
+            "scg_dependency_semantics": (
+                "requires external prodigal and hmmsearch unless refine is run with SCG disabled"
+            ),
         },
     }
     write_json(layout.refine_meta_json, refine_meta)
@@ -368,35 +466,15 @@ def run_refinement(
 def _build_refined_assignment_rows(
     *,
     state: RefineState,
-    support_summary,
-    profiles,
-    feature_matrix,
-    contig_name_to_idx,
 ) -> list[RefinedAssignmentRow]:
     rows: list[RefinedAssignmentRow] = []
     for contig_id in sorted(state.current_assignment.keys()):
         bin_id = state.current_assignment[contig_id]
-        target_support = float(support_summary.support_by_contig_bin.get(contig_id, {}).get(bin_id, 0.0))
-        runner_up_support = float(support_summary.runner_up_support.get(contig_id, 0.0))
-        feature_gate, _feature_score, _feature_note = evaluate_feature_gate(
-            contig_id=contig_id,
-            target_bin=bin_id,
-            feature_matrix=feature_matrix,
-            contig_name_to_idx=contig_name_to_idx,
-            profiles=profiles,
-            coverage_by_contig=state.coverage_by_contig,
-        )
-        confidence = compute_assignment_confidence(
-            target_bin_support=target_support,
-            runner_up_support=runner_up_support,
-            feature_gate=feature_gate,
-        )
         rows.append(
             RefinedAssignmentRow(
                 contig_id=contig_id,
                 bin_id=bin_id,
                 assignment_stage=state.assignment_stage.get(contig_id, "coarse_keep"),
-                assignment_confidence=float(confidence),
                 assignment_reason=state.assignment_reason.get(contig_id, "coarse_assignment_retained"),
             )
         )
@@ -430,3 +508,29 @@ def _next_bin_id(existing_bin_ids) -> int:
         except Exception:
             continue
     return (max(values) + 1) if values else 0
+
+
+def _extract_delta_contact(note: str) -> float | None:
+    for token in str(note).split(";"):
+        token = token.strip()
+        if token.startswith("delta_contact="):
+            value = token.split("=", 1)[1].strip()
+            try:
+                return float(value)
+            except Exception:
+                return None
+    return None
+
+
+def _extract_scg_status(*, reason: str, note: str, scg_enabled: bool) -> str:
+    if not scg_enabled:
+        return "disabled"
+    if "_scg_" in str(reason):
+        return "veto"
+    marker = "scg="
+    if marker in str(note):
+        suffix = str(note).split(marker, 1)[1]
+        status = suffix.split(":", 1)[0].strip()
+        if status in {"veto", "support", "abstain"}:
+            return status
+    return "abstain"

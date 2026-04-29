@@ -24,6 +24,13 @@ def test_porebin_genome_imports_smoke() -> None:
         UNBINNED_COLUMNS,
     )
     from porebin_genome.refine.actions import write_refine_actions_tsv
+    from porebin_genome.refine.coherence import BinCoherenceStat, compute_bin_coherence, delta_contact_coherence
+    from porebin_genome.refine.contact_evidence import BinContactEvidence, collect_contig_bin_evidence
+    from porebin_genome.refine.features import build_bin_feature_profiles, load_refine_feature_inputs
+    from porebin_genome.refine.hyperedge import HyperedgeRecord, HyperedgeStore, load_hyperedges
+    from porebin_genome.refine.local_graph import LocalPairGraph, project_local_pair_graph
+    from porebin_genome.refine.markers import ContigScgProfile, ensure_scg_toolchain_available
+    from porebin_genome.refine.merge import generate_merge_candidates
     from porebin_genome.refine.models import RefineActionRow
     from porebin_genome.refine.orchestrate import RefineRunResult, run_refinement
 
@@ -52,6 +59,21 @@ def test_porebin_genome_imports_smoke() -> None:
     assert RefineRunResult.__name__ == "RefineRunResult"
     assert RefineActionRow.__name__ == "RefineActionRow"
     assert callable(write_refine_actions_tsv)
+    assert HyperedgeRecord.__name__ == "HyperedgeRecord"
+    assert HyperedgeStore.__name__ == "HyperedgeStore"
+    assert callable(load_hyperedges)
+    assert BinCoherenceStat.__name__ == "BinCoherenceStat"
+    assert callable(compute_bin_coherence)
+    assert callable(delta_contact_coherence)
+    assert BinContactEvidence.__name__ == "BinContactEvidence"
+    assert callable(collect_contig_bin_evidence)
+    assert callable(load_refine_feature_inputs)
+    assert callable(build_bin_feature_profiles)
+    assert LocalPairGraph.__name__ == "LocalPairGraph"
+    assert callable(project_local_pair_graph)
+    assert ContigScgProfile.__name__ == "ContigScgProfile"
+    assert callable(ensure_scg_toolchain_available)
+    assert callable(generate_merge_candidates)
     assert callable(export_final_results)
     assert ExportRunResult.__name__ == "ExportRunResult"
     assert CONTACTS_PARQUET_CORE_FIELDS[:3] == ("contact_id", "contigs", "contig_weights")

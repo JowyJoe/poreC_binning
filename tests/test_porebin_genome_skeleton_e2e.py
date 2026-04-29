@@ -29,6 +29,7 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
             str(fixture["contacts"]),
             "--coverage-tsv",
             str(fixture["coverage"]),
+            "--disable-scg",
             "--out",
             str(out_dir),
         ],
@@ -61,7 +62,6 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
         "contig_id",
         "bin_id",
         "assignment_stage",
-        "assignment_confidence",
         "assignment_reason",
     }
     assert "host" not in refined_bins.read_text(encoding="utf-8").lower()
@@ -76,7 +76,9 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
         "n_contigs",
         "total_length",
         "median_coverage",
-        "contact_consistency",
+        "contact_coherence",
+        "scg_status",
+        "scg_duplicate_marker_count",
         "suspect_flag",
         "refine_status",
         "notes",
@@ -84,14 +86,14 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
 
     action_rows = read_tsv_rows(refine_actions)
     assert refine_actions.read_text(encoding="utf-8").splitlines()[0] == (
-        "action_type\tcontig_id\tbin_id\tsource_bin\ttarget_bin\treason\taccepted\tconfidence\tnote"
+        "action_type\tcontig_id\tbin_id\tsource_bin\ttarget_bin\treason\taccepted\tconfidence\tdelta_contact\tscg_status\tnote"
     )
     assert "host" not in refine_actions.read_text(encoding="utf-8").lower()
 
     refine_meta_payload = read_json(refine_meta)
     assert refine_meta_payload["implemented"] is True
     assert refine_meta_payload["n_bins_out"] >= 1
-    assert refine_meta_payload["notes"]["reassign_semantics"] == "move_to_target_bin_only"
+    assert refine_meta_payload["notes"]["reassign_semantics"] == "move_to_target_bin_or_abstain_to_unbinned"
 
     export_result = runner.invoke(
         app,

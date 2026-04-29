@@ -61,19 +61,6 @@ class RefineState:
 
 
 @dataclass(frozen=True)
-class SupportSummary:
-    """Support signals derived from contacts.parquet for the current assignment."""
-
-    support_by_contig_bin: dict[str, dict[str, float]]
-    own_support: dict[str, float]
-    total_support: dict[str, float]
-    runner_up_bin: dict[str, str]
-    runner_up_support: dict[str, float]
-    pair_support_by_bin: dict[str, dict[tuple[str, str], float]]
-    contact_components_by_bin: dict[str, tuple[tuple[str, ...], ...]]
-
-
-@dataclass(frozen=True)
 class BinFeatureProfile:
     """Feature centroid and dispersion profile for one bin."""
 
@@ -98,7 +85,9 @@ class BinSnapshot:
     median_coverage: Optional[float]
     coverage_dispersion: Optional[float]
     feature_dispersion: float
-    contact_consistency: float
+    contact_coherence: float
+    scg_status: str
+    scg_duplicate_marker_count: int
     contact_components: int
     low_support_ratio: float
     suspect_flag: bool
@@ -121,7 +110,6 @@ class RefinedAssignmentRow:
     contig_id: str
     bin_id: str
     assignment_stage: str
-    assignment_confidence: float
     assignment_reason: str
 
 
@@ -144,7 +132,9 @@ class BinQcRow:
     n_contigs: int
     total_length: int
     median_coverage: str
-    contact_consistency: float
+    contact_coherence: float
+    scg_status: str
+    scg_duplicate_marker_count: int
     suspect_flag: bool
     refine_status: str
     notes: str
@@ -162,6 +152,8 @@ class RefineActionRow:
     reason: str
     accepted: bool
     confidence: float
+    delta_contact: float | None
+    scg_status: str
     note: str
 
 
@@ -189,7 +181,7 @@ class SplitDecision:
 
 @dataclass(frozen=True)
 class ReassignCandidate:
-    """A proposal to move one contig to a target bin."""
+    """A proposal to move one boundary contig to a target bin."""
 
     contig_id: str
     source_bin: str
@@ -197,9 +189,8 @@ class ReassignCandidate:
     current_bin_support: float
     target_bin_support: float
     runner_up_support: float
-    runner_up_margin: float
+    target_support_edges: int
     feature_gate: bool
-    non_worsening_gate: bool
     feature_note: str
 
 
@@ -209,6 +200,7 @@ class ReassignDecision:
 
     candidate: ReassignCandidate
     accepted: bool
+    move_to_unbinned: bool
     reason: str
     confidence: float
     note: str
@@ -222,7 +214,7 @@ class RecruitCandidate:
     target_bin: str
     target_bin_support: float
     runner_up_support: float
-    runner_up_margin: float
+    target_support_edges: int
     feature_gate: bool
     feature_note: str
 
@@ -232,6 +224,29 @@ class RecruitDecision:
     """Accepted or rejected recruitment decision."""
 
     candidate: RecruitCandidate
+    accepted: bool
+    reason: str
+    confidence: float
+    note: str
+
+
+@dataclass(frozen=True)
+class MergeCandidate:
+    """A conservative proposal to merge two coarse-split bins."""
+
+    source_bin: str
+    target_bin: str
+    cross_support: float
+    support_edges: int
+    feature_compatible: bool
+    coverage_compatible: bool
+
+
+@dataclass(frozen=True)
+class MergeDecision:
+    """Accepted or rejected merge decision."""
+
+    candidate: MergeCandidate
     accepted: bool
     reason: str
     confidence: float

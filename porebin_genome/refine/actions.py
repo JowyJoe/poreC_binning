@@ -24,6 +24,8 @@ def write_refine_actions_tsv(*, rows: list[RefineActionRow], out_path: Path) -> 
                 row.reason,
                 int(row.accepted),
                 f"{float(row.confidence):.6g}",
+                ("" if row.delta_contact is None else f"{float(row.delta_contact):.6g}"),
+                row.scg_status,
                 row.note,
             )
             for row in rows

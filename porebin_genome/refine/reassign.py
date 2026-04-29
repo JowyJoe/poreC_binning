@@ -1,180 +1,214 @@
-"""Conservative target-bin reassignment and filtering for refine MVP."""
+"""Hyperedge-aware reassignment for boundary contigs."""
 
 from __future__ import annotations
 
-from porebin_genome.refine.models import BinFeatureProfile, ReassignCandidate, ReassignDecision, RefineState, SupportSummary
-from porebin_genome.refine.support import compute_assignment_confidence, evaluate_feature_gate, runner_up_margin
-
-
-REASSIGN_MARGIN_MIN = 0.20
-REASSIGN_CONFIDENCE_MIN = 0.70
-FILTER_CONFIDENCE_MIN = 0.40
+from porebin_genome.refine.coherence import compute_bin_coherence, delta_contact_coherence
+from porebin_genome.refine.contact_evidence import collect_contig_bin_evidence
+from porebin_genome.refine.features import evaluate_feature_gate
+from porebin_genome.refine.hyperedge import HyperedgeStore, ReliabilityFn, default_edge_reliability
+from porebin_genome.refine.markers import (
+    ContigScgProfile,
+    evaluate_reassign_scg_transition,
+)
+from porebin_genome.refine.models import BinFeatureProfile, ReassignCandidate, ReassignDecision, RefineState
 
 
 def generate_reassign_candidates(
     *,
     state: RefineState,
-    support_summary: SupportSummary,
+    store: HyperedgeStore,
     profiles: dict[str, BinFeatureProfile],
     feature_matrix: "object",
     contig_name_to_idx: dict[str, int],
+    reliability_fn: ReliabilityFn | None = None,
 ) -> list[ReassignCandidate]:
-    """Generate conservative target-bin move candidates for weakly assigned contigs."""
+    """Generate boundary-contig move candidates using hyperedge-aware evidence."""
+    reliability_fn = reliability_fn or default_edge_reliability
+
     candidates: list[ReassignCandidate] = []
     for contig_id, source_bin in sorted(state.current_assignment.items()):
-        scores = dict(support_summary.support_by_contig_bin.get(contig_id, {}))
-        if not scores:
+        evidence_by_bin = collect_contig_bin_evidence(
+            store,
+            state.current_assignment,
+            contig_id,
+            reliability_fn=reliability_fn,
+        )
+        if not evidence_by_bin:
             continue
-        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        target_bin = str(ordered[0][0])
-        target_bin_support = float(ordered[0][1])
-        if target_bin == source_bin:
-            if len(ordered) < 2:
-                continue
-            target_bin = str(ordered[1][0])
-            target_bin_support = float(ordered[1][1])
-        current_bin_support = float(scores.get(source_bin, 0.0))
-        if target_bin_support <= current_bin_support:
+
+        current_support = float(evidence_by_bin.get(source_bin).support) if source_bin in evidence_by_bin else 0.0
+        ordered = sorted(
+            evidence_by_bin.values(),
+            key=lambda item: (-float(item.support), str(item.bin_id)),
+        )
+        alternatives = [item for item in ordered if item.bin_id != source_bin and float(item.support) > 0.0]
+        if not alternatives:
             continue
-        secondary_scores = [
-            float(score)
-            for bin_id, score in ordered
-            if str(bin_id) != target_bin
-        ]
-        runner_up_support = float(secondary_scores[0]) if secondary_scores else 0.0
-        margin = runner_up_margin(target_bin_support=target_bin_support, runner_up_support=runner_up_support)
+
+        target = alternatives[0]
+        if float(target.support) + 1e-12 < current_support:
+            continue
+
+        runner_up_support = current_support
+        for item in alternatives[1:]:
+            runner_up_support = max(runner_up_support, float(item.support))
+
         feature_gate, _feature_score, feature_note = evaluate_feature_gate(
             contig_id=contig_id,
-            target_bin=target_bin,
+            target_bin=target.bin_id,
             feature_matrix=feature_matrix,
             contig_name_to_idx=contig_name_to_idx,
             profiles=profiles,
             coverage_by_contig=state.coverage_by_contig,
         )
-        non_worsening_gate = _evaluate_non_worsening_gate(
-            contig_id=contig_id,
-            target_bin=target_bin,
-            profiles=profiles,
-            feature_matrix=feature_matrix,
-            contig_name_to_idx=contig_name_to_idx,
-        )
         candidates.append(
             ReassignCandidate(
                 contig_id=contig_id,
                 source_bin=source_bin,
-                target_bin=target_bin,
-                current_bin_support=current_bin_support,
-                target_bin_support=target_bin_support,
-                runner_up_support=runner_up_support,
-                runner_up_margin=margin,
+                target_bin=str(target.bin_id),
+                current_bin_support=float(current_support),
+                target_bin_support=float(target.support),
+                runner_up_support=float(runner_up_support),
+                target_support_edges=int(target.edge_count),
                 feature_gate=feature_gate,
-                non_worsening_gate=non_worsening_gate,
                 feature_note=feature_note,
             )
         )
     return candidates
 
 
-def evaluate_reassign_candidate(candidate: ReassignCandidate) -> ReassignDecision:
-    """Accept or reject a target-bin move candidate with conservative gates."""
-    confidence = compute_assignment_confidence(
-        target_bin_support=candidate.target_bin_support,
-        runner_up_support=candidate.runner_up_support,
-        feature_gate=candidate.feature_gate,
-    )
-    if candidate.runner_up_margin < REASSIGN_MARGIN_MIN:
+def evaluate_reassign_candidate(
+    *,
+    candidate: ReassignCandidate,
+    state: RefineState,
+    store: HyperedgeStore,
+    profiles: dict[str, BinFeatureProfile],
+    feature_matrix: "object",
+    contig_name_to_idx: dict[str, int],
+    reliability_fn: ReliabilityFn | None = None,
+    contig_scg_profiles: dict[str, ContigScgProfile] | None = None,
+) -> ReassignDecision:
+    """Accept a reassignment only if it improves contact coherence and respects constraints."""
+    reliability_fn = reliability_fn or default_edge_reliability
+
+    if candidate.target_bin_support <= 0.0:
         return ReassignDecision(
             candidate=candidate,
             accepted=False,
-            reason="target_bin_margin_too_small",
-            confidence=float(confidence),
-            note=f"runner_up_margin={candidate.runner_up_margin:.3f}",
+            move_to_unbinned=False,
+            reason="no_positive_target_bin_support",
+            confidence=0.0,
+            note="target_bin_support is not positive",
         )
     if not candidate.feature_gate:
+        move_to_unbinned = candidate.target_bin_support <= candidate.current_bin_support + 1e-12
         return ReassignDecision(
             candidate=candidate,
             accepted=False,
+            move_to_unbinned=move_to_unbinned,
             reason="target_bin_feature_gate_failed",
-            confidence=float(confidence),
+            confidence=0.0,
             note=candidate.feature_note,
         )
-    if not candidate.non_worsening_gate:
+    if not _evaluate_non_worsening_gate(
+        contig_id=candidate.contig_id,
+        target_bin=candidate.target_bin,
+        profiles=profiles,
+        feature_matrix=feature_matrix,
+        contig_name_to_idx=contig_name_to_idx,
+    ):
+        move_to_unbinned = candidate.target_bin_support <= candidate.current_bin_support + 1e-12
         return ReassignDecision(
             candidate=candidate,
             accepted=False,
+            move_to_unbinned=move_to_unbinned,
             reason="target_bin_non_worsening_gate_failed",
-            confidence=float(confidence),
+            confidence=0.0,
             note="adding contig would worsen target feature dispersion",
         )
-    if confidence < REASSIGN_CONFIDENCE_MIN:
+
+    affected_bins = (candidate.source_bin, candidate.target_bin)
+    before_stats = compute_bin_coherence(
+        store,
+        state.current_assignment,
+        reliability_fn=reliability_fn,
+        bins=affected_bins,
+    )
+    after_assignment = dict(state.current_assignment)
+    after_assignment[candidate.contig_id] = candidate.target_bin
+    after_stats = compute_bin_coherence(
+        store,
+        after_assignment,
+        reliability_fn=reliability_fn,
+        bins=affected_bins,
+    )
+    delta_c = float(delta_contact_coherence(before_stats, after_stats))
+    if delta_c <= 0.0:
+        move_to_unbinned = candidate.target_bin_support <= candidate.current_bin_support + 1e-12
         return ReassignDecision(
             candidate=candidate,
             accepted=False,
-            reason="target_bin_assignment_confidence_too_low",
-            confidence=float(confidence),
-            note=f"assignment_confidence={confidence:.3f}",
+            move_to_unbinned=move_to_unbinned,
+            reason="move_does_not_improve_contact_coherence",
+            confidence=0.0,
+            note=f"delta_contact={delta_c:.3f}",
         )
+
+    scg_note = ""
+    if contig_scg_profiles is not None:
+        scg_decision = evaluate_reassign_scg_transition(
+            contig_id=candidate.contig_id,
+            source_bin=candidate.source_bin,
+            target_bin=candidate.target_bin,
+            state=state,
+            contig_profiles=contig_scg_profiles,
+        )
+        scg_note = f";scg={scg_decision.status}:{scg_decision.reason}:{scg_decision.note}"
+        if scg_decision.status == "veto":
+            return ReassignDecision(
+                candidate=candidate,
+                accepted=False,
+                move_to_unbinned=False,
+                reason=scg_decision.reason,
+                confidence=0.0,
+                note=scg_decision.note,
+            )
+
+    confidence = min(1.0, max(0.0, 0.5 + delta_c))
     return ReassignDecision(
         candidate=candidate,
         accepted=True,
+        move_to_unbinned=False,
         reason="move_to_target_bin",
         confidence=float(confidence),
         note=(
+            f"delta_contact={delta_c:.3f};"
             f"target_bin_support={candidate.target_bin_support:.3f};"
             f"current_bin_support={candidate.current_bin_support:.3f};"
-            f"runner_up_margin={candidate.runner_up_margin:.3f}"
+            f"support_edges={candidate.target_support_edges}"
+            f"{scg_note}"
         ),
     )
 
 
 def apply_reassign_decision(*, state: RefineState, decision: ReassignDecision) -> None:
-    """Apply an accepted target-bin move to the refine state."""
-    if not decision.accepted:
+    """Apply an accepted target-bin move or abstain to unbinned."""
+    if decision.accepted:
+        state.assign(
+            decision.candidate.contig_id,
+            decision.candidate.target_bin,
+            stage="reassign",
+            reason="moved_to_target_bin",
+        )
         return
-    state.assign(
-        decision.candidate.contig_id,
-        decision.candidate.target_bin,
-        stage="reassign",
-        reason="moved_to_target_bin",
-    )
-
-
-def filter_low_confidence_assignments(
-    *,
-    state: RefineState,
-    support_summary: SupportSummary,
-    profiles: dict[str, BinFeatureProfile],
-    feature_matrix: "object",
-    contig_name_to_idx: dict[str, int],
-) -> list[tuple[str, str, float, str]]:
-    """Return contigs that should be moved back to unbinned after refine."""
-    filtered: list[tuple[str, str, float, str]] = []
-    for contig_id, current_bin in sorted(list(state.current_assignment.items())):
-        own_support = float(support_summary.support_by_contig_bin.get(contig_id, {}).get(current_bin, 0.0))
-        runner_up_support = float(support_summary.runner_up_support.get(contig_id, 0.0))
-        feature_gate, _feature_score, feature_note = evaluate_feature_gate(
-            contig_id=contig_id,
-            target_bin=current_bin,
-            feature_matrix=feature_matrix,
-            contig_name_to_idx=contig_name_to_idx,
-            profiles=profiles,
-            coverage_by_contig=state.coverage_by_contig,
+    if decision.move_to_unbinned:
+        state.unassign(
+            decision.candidate.contig_id,
+            stage="reassign",
+            reason=decision.reason,
+            source_bin=decision.candidate.source_bin,
+            note=decision.note,
         )
-        confidence = compute_assignment_confidence(
-            target_bin_support=own_support,
-            runner_up_support=runner_up_support,
-            feature_gate=feature_gate,
-        )
-        if confidence < FILTER_CONFIDENCE_MIN:
-            filtered.append(
-                (
-                    contig_id,
-                    current_bin,
-                    float(confidence),
-                    feature_note if not feature_gate else "assignment_confidence_below_threshold",
-                )
-            )
-    return filtered
 
 
 def _evaluate_non_worsening_gate(

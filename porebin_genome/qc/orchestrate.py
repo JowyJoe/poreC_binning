@@ -18,7 +18,9 @@ class BinQcRow:
     n_contigs: int
     total_length: int
     median_coverage: str
-    contact_consistency: str
+    contact_coherence: str
+    scg_status: str
+    scg_duplicate_marker_count: int
     suspect_flag: bool
     refine_status: str
     notes: str
@@ -47,7 +49,9 @@ def write_bin_qc_summary(
                 n_contigs=int(n_contigs[bin_id]),
                 total_length=int(total_length[bin_id]),
                 median_coverage="NA",
-                contact_consistency="NA",
+                contact_coherence="NA",
+                scg_status="no_scg",
+                scg_duplicate_marker_count=0,
                 suspect_flag=False,
                 refine_status="not_evaluated",
                 notes="minimal_qc_summary",
@@ -63,7 +67,9 @@ def write_bin_qc_summary(
                 row.n_contigs,
                 row.total_length,
                 row.median_coverage,
-                row.contact_consistency,
+                row.contact_coherence,
+                row.scg_status,
+                row.scg_duplicate_marker_count,
                 int(row.suspect_flag),
                 row.refine_status,
                 row.notes,

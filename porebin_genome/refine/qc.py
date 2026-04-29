@@ -24,7 +24,9 @@ def build_bin_qc_rows(*, snapshots: dict[str, BinSnapshot]) -> list[BinQcRow]:
                     if snapshot.median_coverage is None
                     else f"{float(snapshot.median_coverage):.6g}"
                 ),
-                contact_consistency=float(snapshot.contact_consistency),
+                contact_coherence=float(snapshot.contact_coherence),
+                scg_status=str(snapshot.scg_status),
+                scg_duplicate_marker_count=int(snapshot.scg_duplicate_marker_count),
                 suspect_flag=bool(snapshot.suspect_flag),
                 refine_status=str(snapshot.refine_status),
                 notes=",".join(snapshot.suspect_reasons) if snapshot.suspect_reasons else "stable_after_refine",
@@ -44,7 +46,9 @@ def write_bin_qc_tsv(*, rows: list[BinQcRow], out_path: Path) -> None:
                 row.n_contigs,
                 row.total_length,
                 row.median_coverage,
-                f"{float(row.contact_consistency):.6g}",
+                f"{float(row.contact_coherence):.6g}",
+                row.scg_status,
+                row.scg_duplicate_marker_count,
                 int(row.suspect_flag),
                 row.refine_status,
                 row.notes,

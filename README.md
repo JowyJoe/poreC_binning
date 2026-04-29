@@ -16,6 +16,15 @@ conda activate porebin-genome
 pip install -e . --no-deps
 ```
 
+### External tool dependencies for refine
+
+`porebin bin` now enables internal SCG veto by default during refinement. This requires:
+
+- `prodigal`
+- `hmmsearch` from HMMER
+
+If either tool is missing, refine will raise an explicit dependency error. For development or testing runs where SCG veto is intentionally disabled, use `--disable-scg`.
+
 ## Public CLI
 
 - `porebin evidence`: build canonical `contacts.parquet` and `coverage.tsv` from a queryname-sorted BAM
@@ -51,6 +60,14 @@ porebin bin \
   --coverage-tsv run_out/evidence/coverage.tsv \
   --out run_out
 
+# optionally disable internal SCG veto for environments without prodigal/hmmsearch
+porebin bin \
+  --contigs contigs.fasta \
+  --contacts run_out/evidence/contacts.parquet \
+  --coverage-tsv run_out/evidence/coverage.tsv \
+  --disable-scg \
+  --out run_out
+
 # export final bins and unresolved contigs
 porebin export \
   --contigs contigs.fasta \
@@ -72,7 +89,6 @@ Final genome-bin assignments with:
 - `contig_id`
 - `bin_id`
 - `assignment_stage`
-- `assignment_confidence`
 - `assignment_reason`
 
 ### `final/unbinned.tsv`
@@ -81,11 +97,11 @@ Contigs that remain unresolved after refinement, with explicit stage and reason.
 
 ### `final/bin_qc.tsv`
 
-Bin-level refine summary including contig count, total length, median coverage, contact consistency, suspect flag, and refine status.
+ Bin-level refine summary including contig count, total length, median coverage, contact coherence, compact SCG status, suspect flag, and refine status.
 
 ### `final/refine_actions.tsv`
 
-Accepted and rejected refine actions for split, reassign, recruit, and filter.
+Accepted and rejected refine actions for split, reassign, merge, and recruit, including per-action `delta_contact` and compact `scg_status`.
 
 ### `final/refine_meta.json`
 
@@ -96,7 +112,7 @@ Stage-level counts for suspect bins, split/reassign/recruit candidates, accepted
 - coarse discovery does not promote HDBSCAN noise into bins by component-majority postprocessing
 - refine is genome-centric and does not use host-centric semantics
 - unresolved contigs remain explicit instead of being forced into bins
-- SCG is not a hard dependency in the current mainline
+- SCG veto is enabled by default in refine and requires external `prodigal` and `hmmsearch`
 
 ## Documentation
 
