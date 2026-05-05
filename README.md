@@ -25,6 +25,24 @@ pip install -e . --no-deps
 
 If either tool is missing, refine will raise an explicit dependency error. For development or testing runs where SCG veto is intentionally disabled, use `--disable-scg`.
 
+Install these command-line tools with conda:
+
+```bash
+conda install -c conda-forge -c bioconda prodigal hmmer
+```
+
+or with mamba:
+
+```bash
+mamba install -c conda-forge -c bioconda prodigal hmmer
+```
+
+If you need to sort BAM files before evidence construction, install `samtools` separately:
+
+```bash
+conda install -c conda-forge -c bioconda samtools
+```
+
 ## Public CLI
 
 - `porebin evidence`: build canonical `contacts.parquet` and `coverage.tsv` from a queryname-sorted BAM
