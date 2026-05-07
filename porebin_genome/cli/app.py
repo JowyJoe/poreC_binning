@@ -29,7 +29,7 @@ def main(
 
 app.command(
     "evidence",
-    help="Evidence construction from reads.namesorted.bam into canonical contact evidence and coverage.",
+    help="Evidence construction from name-sorted BAM into contacts plus contig mean-depth coverage.",
 )(evidence_command)
 app.command(
     "bin",

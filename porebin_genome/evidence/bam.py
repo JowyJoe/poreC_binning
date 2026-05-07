@@ -50,6 +50,7 @@ def bam_to_contact_evidence(
     contigs_fasta: Path,
     out_dir: Path,
     parquet_batch_size: int = 10_000,
+    write_internal_coverage: bool = True,
     logger: Optional[logging.Logger] = None,
 ) -> dict[str, Any]:
     """Convert a queryname-sorted BAM into canonical contact evidence."""
@@ -405,20 +406,23 @@ def bam_to_contact_evidence(
     writer.close()
     bam_fh.close()
 
-    with out_coverage.open("w", encoding="utf-8", newline="") as fh:
-        fh.write("contig_name\tcoverage\n")
-        for contig_name, length in contig_len.items():
-            if length <= 0:
-                continue
-            coverage = float(aligned_bases_weighted.get(contig_name, 0.0)) / float(length)
-            fh.write(f"{contig_name}\t{coverage:.12g}\n")
+    coverage_written = False
+    if write_internal_coverage:
+        with out_coverage.open("w", encoding="utf-8", newline="") as fh:
+            fh.write("contig_name\tcoverage\n")
+            for contig_name, length in contig_len.items():
+                if length <= 0:
+                    continue
+                coverage = float(aligned_bases_weighted.get(contig_name, 0.0)) / float(length)
+                fh.write(f"{contig_name}\t{coverage:.12g}\n")
+        coverage_written = True
 
     qc = {
         "tool": "porebin_genome",
         "inputs": {"bam": str(bam), "contigs_fasta": str(contigs_fasta)},
         "outputs": {
             "contacts_parquet": str(out_parquet),
-            "coverage_tsv": str(out_coverage),
+            "coverage_tsv": str(out_coverage) if coverage_written else None,
         },
         "stats": {
             "reads_total": stats.reads_total,
@@ -444,13 +448,18 @@ def bam_to_contact_evidence(
             "contact_semantics": "one_read_name_equals_one_contact",
             "contig_weights_semantics": "normalized_evidence_shares",
             "weight_semantics": "read_quality_weight_without_pairwise_penalty",
+            "internal_coverage_semantics": (
+                "MAPQ-weighted aligned bases divided by contig length"
+                if coverage_written
+                else "not written"
+            ),
         },
     }
     write_json(out_qc, qc)
 
     return {
         "contacts_parquet": out_parquet,
-        "coverage_tsv": out_coverage,
+        "coverage_tsv": out_coverage if coverage_written else None,
         "qc_json": out_qc,
         "stats": qc["stats"],
     }

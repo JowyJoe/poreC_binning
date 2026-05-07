@@ -25,6 +25,11 @@ def bin_command(
         "--scg-hmm",
         help="Optional override for the bundled bacterial core SCG HMM database.",
     ),
+    knn_k: str = typer.Option(
+        "adaptive",
+        "--knn-k",
+        help="Feature graph neighborhood size: 'adaptive' by default, or a positive integer for fixed k.",
+    ),
     out: Path = typer.Option(..., "--out", help="Output directory."),
 ) -> None:
     """Run coarse candidate-bin discovery followed by the genome-centric refine MVP."""
@@ -35,6 +40,7 @@ def bin_command(
         "coverage_tsv": str(coverage_tsv),
         "disable_scg": bool(disable_scg),
         "scg_hmm": (str(scg_hmm) if scg_hmm is not None else None),
+        "knn_k": str(knn_k),
         "out": str(out),
     }
     with record_run(out, command="bin", params=params) as run_record:
@@ -43,6 +49,7 @@ def bin_command(
             contacts_parquet=contacts,
             coverage_tsv=coverage_tsv,
             out_dir=out,
+            feature_knn_k=knn_k,
         )
         refine_result = run_refinement(
             contigs_fasta=contigs,

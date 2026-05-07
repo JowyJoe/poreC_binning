@@ -29,6 +29,8 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
             str(fixture["contacts"]),
             "--coverage-tsv",
             str(fixture["coverage"]),
+            "--knn-k",
+            "2",
             "--disable-scg",
             "--out",
             str(out_dir),

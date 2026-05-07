@@ -74,3 +74,83 @@ def test_feature_matrix_operator_embedding_and_clustering_shapes(tmp_path: Path)
     assert embedding.shape[1] >= 1
     assert labels.shape == (len(names),)
     assert meta["impl"] == "hdbscan"
+
+
+def test_adaptive_feature_knn_edges_emit_report(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn", reason="scikit-learn required for adaptive feature kNN test")
+
+    import numpy as np
+
+    from porebin_genome.coarse.operator import build_adaptive_feature_knn_edges, write_adaptive_knn_report
+    from tests.porebin_genome_testkit import read_tsv_rows
+
+    names = [f"c{idx}" for idx in range(6)]
+    X = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.05, 0.0],
+            [0.0, 0.06],
+            [10.0, 10.0],
+            [10.05, 10.0],
+            [10.0, 10.06],
+        ],
+        dtype=float,
+    )
+
+    result = build_adaptive_feature_knn_edges(
+        X,
+        contig_ids=names,
+        min_k=2,
+        default_k=4,
+        k_max=5,
+        drop_ratio=0.15,
+        mutual_knn=True,
+    )
+    report_path = tmp_path / "adaptive_k_report.tsv"
+    write_adaptive_knn_report(report_path, result.report_rows)
+    report_rows = read_tsv_rows(report_path)
+
+    assert result.neighbors.shape[0] == len(names)
+    assert result.meta["mode"] == "adaptive"
+    assert result.meta["min_k"] == 2
+    assert result.meta["default_k"] == 4
+    assert result.meta["k_max"] == 5
+    assert result.meta["mutual_knn"] is True
+    assert result.meta["fallback_used"] is False
+    assert len(result.report_rows) == len(names)
+    assert all(row.selected_k_i >= 2 for row in result.report_rows)
+    assert any("after_rank_2" in row.cutoff_reason for row in result.report_rows)
+    assert len(report_rows) == len(names)
+    assert {
+        "contig_id",
+        "selected_k_i",
+        "top_score",
+        "cutoff_score",
+        "cutoff_rank",
+        "cutoff_reason",
+    }.issubset(report_rows[0])
+
+
+def test_adaptive_knn_fallback_report_and_meta() -> None:
+    from porebin_genome.coarse.operator import build_adaptive_knn_fallback_report_rows, build_adaptive_knn_meta
+
+    rows = build_adaptive_knn_fallback_report_rows(
+        contig_ids=["a", "b", "c"],
+        fallback_k=15,
+        n_contigs=3,
+    )
+    meta = build_adaptive_knn_meta(
+        min_k=5,
+        default_k=15,
+        k_max=30,
+        drop_ratio=0.15,
+        mutual_knn=True,
+        fallback_used=True,
+        fallback_reason="synthetic failure",
+    )
+
+    assert [row.selected_k_i for row in rows] == [2, 2, 2]
+    assert all(row.cutoff_reason == "fallback_fixed_k_2" for row in rows)
+    assert meta["fallback_used"] is True
+    assert meta["fallback_reason"] == "synthetic failure"
+    assert "method_reference_note" in meta

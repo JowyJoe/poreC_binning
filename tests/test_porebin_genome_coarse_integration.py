@@ -20,6 +20,7 @@ def test_dual_community_synthetic_produces_multiple_candidate_bins(tmp_path: Pat
         contacts_parquet=fixture["contacts"],
         coverage_tsv=fixture["coverage"],
         out_dir=out_dir,
+        feature_knn_k=2,
     )
 
     coarse_rows = read_tsv_rows(result.bins_tsv)
@@ -30,6 +31,7 @@ def test_dual_community_synthetic_produces_multiple_candidate_bins(tmp_path: Pat
     assert len({row["bin_id"] for row in coarse_rows}) >= 2
     assert coarse_run["n_bins"] >= 2
     assert coarse_run["n_contigs_clustered"] >= 2
+    assert coarse_run["lambda_contact"] == 0.5
     assert coarse_run["collapse_warning"] is False
     assert "host" not in result.bins_tsv.read_text(encoding="utf-8").lower()
     assert "host" not in result.run_json.read_text(encoding="utf-8").lower()
@@ -67,6 +69,67 @@ def test_coarse_run_json_contains_required_collapse_audit_fields(tmp_path: Path)
         assert key in coarse_run
 
 
+def test_default_knn_mode_is_adaptive_and_writes_report_and_meta(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow", reason="pyarrow required for adaptive coarse integration test")
+    pytest.importorskip("hdbscan", reason="hdbscan required for adaptive coarse integration test")
+
+    from porebin_genome.coarse.orchestrate import run_coarse_discovery
+
+    fixture = write_dual_community_fixture(tmp_path, community_size=4)
+    out_dir = tmp_path / "out"
+    result = run_coarse_discovery(
+        contigs_fasta=fixture["contigs"],
+        contacts_parquet=fixture["contacts"],
+        coverage_tsv=fixture["coverage"],
+        out_dir=out_dir,
+    )
+    coarse_run = read_json(result.run_json)
+    adaptive_report = read_tsv_rows(out_dir / "coarse" / "adaptive_k_report.tsv")
+    adaptive_meta = read_json(out_dir / "coarse" / "adaptive_k_meta.json")
+
+    assert adaptive_report
+    assert len(adaptive_report) == len(fixture["all_names"])
+    assert {
+        "contig_id",
+        "selected_k_i",
+        "top_score",
+        "cutoff_score",
+        "cutoff_rank",
+        "cutoff_reason",
+    }.issubset(adaptive_report[0])
+    assert adaptive_meta["mode"] == "adaptive"
+    assert adaptive_meta["min_k"] == 5
+    assert adaptive_meta["default_k"] == 15
+    assert adaptive_meta["k_max"] == 30
+    assert adaptive_meta["drop_ratio"] == 0.15
+    assert adaptive_meta["mutual_knn"] is True
+    assert adaptive_meta["fallback_used"] is False
+    assert coarse_run["feature_knn_mode"] == "adaptive"
+    assert "adaptive_k_report_tsv" in coarse_run["outputs"]
+
+
+def test_fixed_knn_mode_still_uses_manual_integer_k(tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow", reason="pyarrow required for fixed coarse integration test")
+    pytest.importorskip("hdbscan", reason="hdbscan required for fixed coarse integration test")
+
+    from porebin_genome.coarse.orchestrate import run_coarse_discovery
+
+    fixture = write_dual_community_fixture(tmp_path, community_size=4)
+    out_dir = tmp_path / "out"
+    result = run_coarse_discovery(
+        contigs_fasta=fixture["contigs"],
+        contacts_parquet=fixture["contacts"],
+        coverage_tsv=fixture["coverage"],
+        out_dir=out_dir,
+        feature_knn_k=7,
+    )
+    coarse_run = read_json(result.run_json)
+
+    assert coarse_run["feature_knn_mode"] == "fixed"
+    assert coarse_run["feature_knn_k"] == 7
+    assert "adaptive_k_report_tsv" not in coarse_run["outputs"]
+
+
 def test_collapse_warning_is_emitted_for_overcollapsed_labels() -> None:
     import numpy as np
 
@@ -80,7 +143,7 @@ def test_collapse_warning_is_emitted_for_overcollapsed_labels() -> None:
         labels=np.zeros((8,), dtype=int),
         feature_mode="tnf_plus_cov",
         embedding_dim=4,
-        lambda_contact=0.6,
+        lambda_contact=0.5,
         contact_hyperedge_count=12,
         feature_knn_k=7,
         dropped_singleton_contacts=0,

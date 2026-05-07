@@ -16,6 +16,26 @@ conda activate porebin-genome
 pip install -e . --no-deps
 ```
 
+### External command-line dependencies
+
+`porebin evidence` uses CoverM by default to compute contig mean depth from a contig-aligned BAM:
+
+- `coverm`
+
+Install CoverM with conda:
+
+```bash
+conda install -c conda-forge -c bioconda coverm
+```
+
+or with mamba:
+
+```bash
+mamba install -c conda-forge -c bioconda coverm
+```
+
+`coverage.tsv` stores per-contig mean read depth for binning abundance consistency. It does not store the coverage-breadth percentage reported by some tools.
+
 ### External tool dependencies for refine
 
 `porebin bin` now enables internal SCG veto by default during refinement. This requires:
@@ -37,7 +57,7 @@ or with mamba:
 mamba install -c conda-forge -c bioconda prodigal hmmer
 ```
 
-If you need to sort BAM files before evidence construction, install `samtools` separately:
+If you need to sort BAM files before evidence construction or CoverM coverage, install `samtools` separately:
 
 ```bash
 conda install -c conda-forge -c bioconda samtools
@@ -45,7 +65,7 @@ conda install -c conda-forge -c bioconda samtools
 
 ## Public CLI
 
-- `porebin evidence`: build canonical `contacts.parquet` and `coverage.tsv` from a queryname-sorted BAM
+- `porebin evidence`: build canonical `contacts.parquet` from a queryname-sorted BAM and `coverage.tsv` from CoverM or an existing coverage table
 - `porebin bin`: run coarse candidate genome-bin discovery and genome-bin refinement
 - `porebin export`: export final genome bins and unresolved contigs as FASTA
 
@@ -65,9 +85,29 @@ contigs.fasta + contacts.parquet + coverage.tsv
 ## Recommended workflow
 
 ```bash
-# build evidence from a queryname-sorted BAM
+# prepare BAMs when starting from one aligned BAM
+samtools sort -n -o reads.namesorted.bam reads.bam
+samtools sort -o reads.coordsorted.bam reads.bam
+samtools index reads.coordsorted.bam
+
+# build evidence from a queryname-sorted BAM and CoverM mean-depth from a reference-sorted BAM
 porebin evidence \
   --bam reads.namesorted.bam \
+  --coverage-bam reads.coordsorted.bam \
+  --contigs contigs.fasta \
+  --out run_out
+
+# or adopt an existing porebin-compatible coverage table without recomputing coverage
+porebin evidence \
+  --bam reads.namesorted.bam \
+  --coverage-tsv coverage.tsv \
+  --contigs contigs.fasta \
+  --out run_out
+
+# development fallback without CoverM; not recommended for final benchmarking
+porebin evidence \
+  --bam reads.namesorted.bam \
+  --coverage-method internal \
   --contigs contigs.fasta \
   --out run_out
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,7 +12,20 @@ from porebin_genome.coarse.contact import build_contact_incidence_from_parquet
 from porebin_genome.coarse.embed import auto_embedding_dim, spectral_embed_joint
 from porebin_genome.coarse.features import build_feature_matrix
 from porebin_genome.coarse.metadata import build_coarse_run_record
-from porebin_genome.coarse.operator import build_feature_incidence, build_feature_knn_edges, make_theta_operator
+from porebin_genome.coarse.operator import (
+    DEFAULT_ADAPTIVE_DROP_RATIO,
+    DEFAULT_ADAPTIVE_K,
+    DEFAULT_ADAPTIVE_K_MAX,
+    DEFAULT_ADAPTIVE_MIN_K,
+    DEFAULT_ADAPTIVE_MUTUAL_KNN,
+    build_adaptive_feature_knn_edges,
+    build_adaptive_knn_fallback_report_rows,
+    build_adaptive_knn_meta,
+    build_feature_incidence,
+    build_feature_knn_edges,
+    make_theta_operator,
+    write_adaptive_knn_report,
+)
 from porebin_genome.io.contacts import validate_contacts_parquet_core_schema
 from porebin_genome.io.contracts import build_pipeline_layout
 from porebin_genome.io.coverage import validate_coverage_tsv
@@ -21,7 +35,8 @@ from porebin_genome.io.runtime import ensure_dir, write_json
 
 DEFAULT_FEATURE_MODE = "tnf_plus_cov"
 DEFAULT_FEATURE_KNN_K = 15
-DEFAULT_LAMBDA_CONTACT = 0.60
+ADAPTIVE_FEATURE_KNN_MODE = "adaptive"
+DEFAULT_LAMBDA_CONTACT = 0.50
 DEFAULT_HDBSCAN_SELECTION_METHOD = "leaf"
 
 
@@ -55,6 +70,42 @@ def _default_hdbscan_min_cluster_size(n_contigs: int) -> int:
     return 5
 
 
+def _get_logger(logger: Optional[object]) -> object:
+    return logger if logger is not None else logging.getLogger("porebin_genome")
+
+
+def _log(logger: Optional[object], level: str, message: str) -> None:
+    target = _get_logger(logger)
+    log_fn = getattr(target, level, None)
+    if callable(log_fn):
+        log_fn(message)
+
+
+def _parse_feature_knn_k(feature_knn_k: int | str) -> tuple[str, int]:
+    if isinstance(feature_knn_k, str):
+        text = feature_knn_k.strip().lower()
+        if text == ADAPTIVE_FEATURE_KNN_MODE:
+            return ADAPTIVE_FEATURE_KNN_MODE, DEFAULT_FEATURE_KNN_K
+        try:
+            fixed_k = int(text)
+        except ValueError as exc:
+            raise ValueError("--knn-k must be a positive integer or 'adaptive'.") from exc
+    else:
+        fixed_k = int(feature_knn_k)
+    if fixed_k < 1:
+        raise ValueError("--knn-k must be a positive integer or 'adaptive'.")
+    return "fixed", fixed_k
+
+
+def _count_neighbor_edges(neighbors: "object") -> int:
+    import numpy as np
+
+    arr = np.asarray(neighbors, dtype=np.int32)
+    if arr.size == 0:
+        return 0
+    return int(np.sum(arr >= 0))
+
+
 def run_coarse_discovery(
     *,
     contigs_fasta: Path,
@@ -64,8 +115,7 @@ def run_coarse_discovery(
     logger: Optional[object] = None,
     seed: int = 0,
     feature_mode: str = DEFAULT_FEATURE_MODE,
-    feature_knn_k: int = DEFAULT_FEATURE_KNN_K,
-    lambda_contact: float = DEFAULT_LAMBDA_CONTACT,
+    feature_knn_k: int | str = ADAPTIVE_FEATURE_KNN_MODE,
     embedding_dim: Optional[int] = None,
     hdbscan_min_cluster_size: Optional[int] = None,
     hdbscan_min_samples: Optional[int] = None,
@@ -73,7 +123,6 @@ def run_coarse_discovery(
     threads: int = 1,
 ) -> CoarseRunResult:
     """Run real coarse candidate genome-bin discovery without any component/noise postprocess."""
-    _ = logger
     layout = build_pipeline_layout(out_dir)
     ensure_dir(layout.coarse_dir)
 
@@ -101,7 +150,60 @@ def run_coarse_discovery(
         feature_mode=feature_mode,
         logger=logger,
     )
-    neighbors = build_feature_knn_edges(feature_matrix.X, feature_knn_k)
+    feature_knn_mode, fixed_feature_knn_k = _parse_feature_knn_k(feature_knn_k)
+    adaptive_k_meta: dict[str, object] | None = None
+    if feature_knn_mode == ADAPTIVE_FEATURE_KNN_MODE:
+        try:
+            adaptive = build_adaptive_feature_knn_edges(
+                feature_matrix.X,
+                contig_ids=idx_to_name,
+                min_k=DEFAULT_ADAPTIVE_MIN_K,
+                default_k=DEFAULT_ADAPTIVE_K,
+                k_max=DEFAULT_ADAPTIVE_K_MAX,
+                drop_ratio=DEFAULT_ADAPTIVE_DROP_RATIO,
+                mutual_knn=DEFAULT_ADAPTIVE_MUTUAL_KNN,
+            )
+            neighbors = adaptive.neighbors
+            if contigs_total > 1 and _count_neighbor_edges(neighbors) == 0:
+                raise RuntimeError("adaptive mutual-kNN filtering removed all feature-neighbor edges")
+            adaptive_k_meta = adaptive.meta
+            write_adaptive_knn_report(layout.adaptive_k_report_tsv, adaptive.report_rows)
+            write_json(layout.adaptive_k_meta_json, adaptive_k_meta)
+            _log(
+                logger,
+                "info",
+                (
+                    "[adaptive-k] built local adaptive feature graph: "
+                    f"min_k={DEFAULT_ADAPTIVE_MIN_K}, default_k={DEFAULT_ADAPTIVE_K}, "
+                    f"k_max={DEFAULT_ADAPTIVE_K_MAX}, mutual_knn={DEFAULT_ADAPTIVE_MUTUAL_KNN}"
+                ),
+            )
+        except Exception as exc:
+            fallback_reason = f"{type(exc).__name__}: {exc}"
+            _log(logger, "warning", f"[adaptive-k] fallback to fixed k=15: {fallback_reason}")
+            neighbors = build_feature_knn_edges(feature_matrix.X, DEFAULT_FEATURE_KNN_K)
+            adaptive_k_meta = build_adaptive_knn_meta(
+                min_k=DEFAULT_ADAPTIVE_MIN_K,
+                default_k=DEFAULT_ADAPTIVE_K,
+                k_max=DEFAULT_ADAPTIVE_K_MAX,
+                drop_ratio=DEFAULT_ADAPTIVE_DROP_RATIO,
+                mutual_knn=DEFAULT_ADAPTIVE_MUTUAL_KNN,
+                fallback_used=True,
+                fallback_reason=fallback_reason,
+                fallback_k=DEFAULT_FEATURE_KNN_K,
+                n_contigs=contigs_total,
+            )
+            write_adaptive_knn_report(
+                layout.adaptive_k_report_tsv,
+                build_adaptive_knn_fallback_report_rows(
+                    contig_ids=idx_to_name,
+                    fallback_k=DEFAULT_FEATURE_KNN_K,
+                    n_contigs=contigs_total,
+                ),
+            )
+            write_json(layout.adaptive_k_meta_json, adaptive_k_meta)
+    else:
+        neighbors = build_feature_knn_edges(feature_matrix.X, fixed_feature_knn_k)
     feature = build_feature_incidence(neighbors)
 
     contact_theta = make_theta_operator(contact.H_csr, contact.W, contact.De, contact.Dv)
@@ -111,7 +213,7 @@ def run_coarse_discovery(
     Z = spectral_embed_joint(
         contact_op=contact_theta.op,
         feature_op=feature_theta.op,
-        lambda_contact=float(lambda_contact),
+        lambda_contact=DEFAULT_LAMBDA_CONTACT,
         d=target_embedding_dim,
         seed=int(seed),
     )
@@ -140,7 +242,7 @@ def run_coarse_discovery(
         labels=cluster_result.labels,
         feature_mode=feature_matrix.feature_mode,
         embedding_dim=int(Z.shape[1]),
-        lambda_contact=float(lambda_contact),
+        lambda_contact=DEFAULT_LAMBDA_CONTACT,
         contact_hyperedge_count=int(contact.contact_hyperedge_count),
         feature_knn_k=int(feature.feature_knn_k),
         dropped_singleton_contacts=int(contact.dropped_singleton_contacts),
@@ -148,6 +250,11 @@ def run_coarse_discovery(
         coverage_missing_count=int(feature_matrix.coverage_missing_count),
         hdbscan_meta=hdbscan_meta,
     )
+    run_record["feature_knn_mode"] = feature_knn_mode
+    if adaptive_k_meta is not None:
+        run_record["outputs"]["adaptive_k_report_tsv"] = str(layout.adaptive_k_report_tsv)
+        run_record["outputs"]["adaptive_k_meta_json"] = str(layout.adaptive_k_meta_json)
+        run_record["adaptive_k"] = dict(adaptive_k_meta)
     write_json(layout.coarse_run_json, run_record)
 
     return CoarseRunResult(

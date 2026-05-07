@@ -82,6 +82,8 @@ class PipelineLayout:
     evidence_qc_json: Path
     coarse_bins_tsv: Path
     coarse_run_json: Path
+    adaptive_k_report_tsv: Path
+    adaptive_k_meta_json: Path
     refined_bins_tsv: Path
     unbinned_tsv: Path
     bin_qc_tsv: Path
@@ -110,6 +112,8 @@ def build_pipeline_layout(out_dir: Path) -> PipelineLayout:
         evidence_qc_json=evidence_dir / "evidence_qc.json",
         coarse_bins_tsv=coarse_dir / "bins.tsv",
         coarse_run_json=coarse_dir / "run.json",
+        adaptive_k_report_tsv=coarse_dir / "adaptive_k_report.tsv",
+        adaptive_k_meta_json=coarse_dir / "adaptive_k_meta.json",
         refined_bins_tsv=final_dir / "bins.refined.tsv",
         unbinned_tsv=final_dir / "unbinned.tsv",
         bin_qc_tsv=final_dir / "bin_qc.tsv",

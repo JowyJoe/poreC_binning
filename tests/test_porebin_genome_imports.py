@@ -8,10 +8,16 @@ def test_porebin_genome_imports_smoke() -> None:
     from porebin_genome.coarse.contact import ContactIncidence, build_contact_incidence_from_parquet
     from porebin_genome.coarse.embed import auto_embedding_dim, spectral_embed_joint
     from porebin_genome.coarse.features import FeatureMatrix, build_feature_matrix
-    from porebin_genome.coarse.operator import build_feature_incidence, build_feature_knn_edges, make_theta_operator
+    from porebin_genome.coarse.operator import (
+        build_adaptive_feature_knn_edges,
+        build_feature_incidence,
+        build_feature_knn_edges,
+        make_theta_operator,
+    )
     from porebin_genome.coarse.orchestrate import CoarseRunResult, run_coarse_discovery
     from porebin_genome.evidence.bam import BamEvidenceStats, bam_to_contact_evidence
     from porebin_genome.evidence.canonical import CanonicalContact, canonicalize_contact
+    from porebin_genome.evidence.preflight import EvidencePreflightReport, run_evidence_preflight
     from porebin_genome.evidence.tnf import TNF136_LIST, compute_tnf136_features
     from porebin_genome.export.orchestrate import ExportRunResult, export_final_results
     from porebin_genome.io.contracts import (
@@ -40,6 +46,8 @@ def test_porebin_genome_imports_smoke() -> None:
     assert callable(canonicalize_contact)
     assert BamEvidenceStats.__name__ == "BamEvidenceStats"
     assert callable(bam_to_contact_evidence)
+    assert EvidencePreflightReport.__name__ == "EvidencePreflightReport"
+    assert callable(run_evidence_preflight)
     assert len(TNF136_LIST) == 136
     assert callable(compute_tnf136_features)
     assert ContactIncidence.__name__ == "ContactIncidence"
@@ -47,6 +55,7 @@ def test_porebin_genome_imports_smoke() -> None:
     assert FeatureMatrix.__name__ == "FeatureMatrix"
     assert callable(build_feature_matrix)
     assert callable(build_feature_knn_edges)
+    assert callable(build_adaptive_feature_knn_edges)
     assert callable(build_feature_incidence)
     assert callable(make_theta_operator)
     assert callable(auto_embedding_dim)
