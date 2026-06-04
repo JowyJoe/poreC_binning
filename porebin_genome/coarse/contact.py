@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from porebin_genome.coarse.hyperedge_weight import (
+    DEFAULT_HYPERGRAPH_WEIGHT_ETA,
+    hypergraph_native_weight,
+    normalize_contact_weight_mode,
+)
 from porebin_genome.evidence.canonical import ContactEvidenceError, iter_canonical_contacts
 
 
@@ -29,6 +34,8 @@ def build_contact_incidence_from_parquet(
     contacts_path: Path,
     contig_name_to_idx: dict[str, int],
     *,
+    weight_mode: str = "original",
+    hypergraph_weight_eta: float = DEFAULT_HYPERGRAPH_WEIGHT_ETA,
     parquet_batch_size: int = 200_000,
     logger: Optional[object] = None,
 ) -> ContactIncidence:
@@ -45,6 +52,11 @@ def build_contact_incidence_from_parquet(
         raise CoarseContactError("Contact incidence construction requires numpy and scipy.") from exc
 
     n_contigs = len(contig_name_to_idx)
+    try:
+        mode = normalize_contact_weight_mode(weight_mode)
+    except ValueError as exc:
+        raise CoarseContactError(str(exc)) from exc
+
     dropped = 0
     rows: list[int] = []
     cols: list[int] = []
@@ -65,7 +77,18 @@ def build_contact_incidence_from_parquet(
             if row.contig_weights is None:
                 raise CoarseContactError("Canonical contact row is missing contig_weights.")
 
-            edge_weight = float(row.weight) / float(row.k_valid - 1)
+            if mode == "hypergraph_native":
+                edge_weight = hypergraph_native_weight(
+                    read_weight=float(row.weight),
+                    alpha_values=row.contig_weights,
+                    eta=float(hypergraph_weight_eta),
+                )
+            else:
+                edge_weight = float(row.weight) / float(row.k_valid - 1)
+            if edge_weight <= 0.0:
+                dropped += 1
+                continue
+
             degree = 0.0
             edge_rows: list[int] = []
             edge_data: list[float] = []

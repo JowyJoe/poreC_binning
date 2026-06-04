@@ -6,6 +6,7 @@ dependencies:
   - python=3.10
   - pip
   - pyarrow>=14
+  - pytorch>=2.0
   - pysam
   - scipy
   - scikit-learn
@@ -13,4 +14,8 @@ dependencies:
   - typer>=0.12
   - igraph>=1.0
   - leidenalg>=0.11
+  - coverm
+  - samtools
+  - prodigal
+  - hmmer
   - pytest>=7.0

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Collection, Mapping
 
+from porebin_genome.coarse.hyperedge_weight import (
+    DEFAULT_HYPERGRAPH_WEIGHT_ETA,
+    hypergraph_native_weight,
+)
 from porebin_genome.evidence.canonical import iter_canonical_contacts
 
 
@@ -38,7 +42,7 @@ def load_hyperedges(contacts_parquet: Path, *, min_k: int = 2) -> HyperedgeStore
     edges: list[HyperedgeRecord] = []
     edge_ids_by_contig: dict[str, list[int]] = {}
 
-    for edge_id, row in enumerate(
+    for row_idx, row in enumerate(
         iter_canonical_contacts(contacts_parquet, require_contig_weights=True)
     ):
         if row.k_valid < int(min_k):
@@ -58,6 +62,7 @@ def load_hyperedges(contacts_parquet: Path, *, min_k: int = 2) -> HyperedgeStore
             continue
         k_eff = 1.0 / concentration
 
+        edge_id = int(row.contact_id if row.contact_id is not None else row_idx)
         edge = HyperedgeRecord(
             edge_id=int(edge_id),
             members=members,
@@ -84,6 +89,21 @@ def load_hyperedges(contacts_parquet: Path, *, min_k: int = 2) -> HyperedgeStore
 def default_edge_reliability(edge: HyperedgeRecord) -> float:
     """MVP edge reliability: clip the upstream read-level weight into [0, 1]."""
     return _clip01(edge.read_weight)
+
+
+def make_hypergraph_native_edge_weight_fn(
+    eta: float = DEFAULT_HYPERGRAPH_WEIGHT_ETA,
+) -> ReliabilityFn:
+    """Build a refinement edge-weight function from q_e, alpha, and k_eff."""
+
+    def _edge_weight(edge: HyperedgeRecord) -> float:
+        return hypergraph_native_weight(
+            read_weight=float(edge.read_weight),
+            alpha_values=edge.alpha,
+            eta=float(eta),
+        )
+
+    return _edge_weight
 
 
 def collect_edge_ids_for_contig(store: HyperedgeStore, contig_id: str) -> tuple[int, ...]:

@@ -15,6 +15,7 @@ class ContactEvidenceError(RuntimeError):
 class CanonicalContact:
     """One canonicalized Pore-C contact row."""
 
+    contact_id: int | None
     contigs: list[str]
     contig_weights: Optional[list[float]]
     k_input: int
@@ -26,6 +27,7 @@ def canonicalize_contact(
     *,
     contigs_raw: object,
     contig_weights_raw: object = None,
+    contact_id_raw: object = None,
     k_raw: object = None,
     weight_raw: object = None,
     row_number: Optional[int] = None,
@@ -100,7 +102,17 @@ def canonicalize_contact(
     except Exception as exc:
         raise ContactEvidenceError(f"Invalid weight value in {label}: {weight_raw!r}") from exc
 
+    contact_id: int | None
+    if contact_id_raw is None:
+        contact_id = (int(row_number) - 1) if row_number is not None else None
+    else:
+        try:
+            contact_id = int(contact_id_raw)
+        except Exception as exc:
+            raise ContactEvidenceError(f"Invalid contact_id value in {label}: {contact_id_raw!r}") from exc
+
     return CanonicalContact(
+        contact_id=contact_id,
         contigs=contigs,
         contig_weights=contig_weights,
         k_input=k_input,
@@ -136,10 +148,12 @@ def iter_canonical_contacts(
         )
 
     has_contig_weights = "contig_weights" in columns
+    has_contact_id = "contact_id" in columns
     has_k = "k" in columns
     has_weight = "weight" in columns
     read_columns = (
         ["contigs"]
+        + (["contact_id"] if has_contact_id else [])
         + (["contig_weights"] if has_contig_weights else [])
         + (["k"] if has_k else [])
         + (["weight"] if has_weight else [])
@@ -149,6 +163,7 @@ def iter_canonical_contacts(
     for batch in parquet.iter_batches(batch_size=int(parquet_batch_size), columns=read_columns):
         data = batch.to_pydict()
         contigs_list = data["contigs"]
+        contact_id_list = data.get("contact_id")
         contig_weights_list = data.get("contig_weights")
         k_list = data.get("k")
         weight_list = data.get("weight")
@@ -156,6 +171,7 @@ def iter_canonical_contacts(
             row_number += 1
             yield canonicalize_contact(
                 contigs_raw=contigs_list[idx] or [],
+                contact_id_raw=(contact_id_list[idx] if contact_id_list is not None else None),
                 contig_weights_raw=(contig_weights_list[idx] or []) if contig_weights_list is not None else None,
                 k_raw=(k_list[idx] if k_list is not None else None),
                 weight_raw=(weight_list[idx] if weight_list is not None else None),

@@ -130,6 +130,14 @@ def test_fixed_knn_mode_still_uses_manual_integer_k(tmp_path: Path) -> None:
     assert "adaptive_k_report_tsv" not in coarse_run["outputs"]
 
 
+def test_coarse_method_normalization_accepts_hgvae_aliases() -> None:
+    from porebin_genome.coarse.orchestrate import normalize_coarse_method
+
+    assert normalize_coarse_method("spectral") == "spectral"
+    assert normalize_coarse_method("hgvae") == "hgvae"
+    assert normalize_coarse_method("hg-vae") == "hgvae"
+
+
 def test_collapse_warning_is_emitted_for_overcollapsed_labels() -> None:
     import numpy as np
 

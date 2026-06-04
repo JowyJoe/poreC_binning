@@ -84,10 +84,22 @@ class PipelineLayout:
     coarse_run_json: Path
     adaptive_k_report_tsv: Path
     adaptive_k_meta_json: Path
+    pairwise_clique_contacts_parquet: Path
+    pairwise_clique_meta_json: Path
+    pairwise_normalized_contacts_parquet: Path
+    pairwise_normalization_meta_json: Path
+    pairwise_leiden_bins_tsv: Path
+    pairwise_leiden_sweep_tsv: Path
+    pairwise_baseline_meta_json: Path
+    hyperedge_embedding_tsv: Path
+    hyperedge_embedding_meta_json: Path
     refined_bins_tsv: Path
     unbinned_tsv: Path
     bin_qc_tsv: Path
     refine_actions_tsv: Path
+    refine_action_features_tsv: Path
+    refine_action_scores_tsv: Path
+    refine_embedding_scores_tsv: Path
     refine_meta_json: Path
     export_meta_json: Path
     bins_fasta_dir: Path
@@ -114,10 +126,22 @@ def build_pipeline_layout(out_dir: Path) -> PipelineLayout:
         coarse_run_json=coarse_dir / "run.json",
         adaptive_k_report_tsv=coarse_dir / "adaptive_k_report.tsv",
         adaptive_k_meta_json=coarse_dir / "adaptive_k_meta.json",
+        pairwise_clique_contacts_parquet=coarse_dir / "pairwise_clique_contacts.parquet",
+        pairwise_clique_meta_json=coarse_dir / "pairwise_clique_meta.json",
+        pairwise_normalized_contacts_parquet=coarse_dir / "pairwise_normalized_contacts.parquet",
+        pairwise_normalization_meta_json=coarse_dir / "pairwise_normalization_meta.json",
+        pairwise_leiden_bins_tsv=coarse_dir / "bins.pairwise_leiden.tsv",
+        pairwise_leiden_sweep_tsv=coarse_dir / "pairwise_leiden_sweep.tsv",
+        pairwise_baseline_meta_json=coarse_dir / "pairwise_baseline_meta.json",
+        hyperedge_embedding_tsv=coarse_dir / "hyperedge_embedding.tsv",
+        hyperedge_embedding_meta_json=coarse_dir / "hyperedge_embedding_meta.json",
         refined_bins_tsv=final_dir / "bins.refined.tsv",
         unbinned_tsv=final_dir / "unbinned.tsv",
         bin_qc_tsv=final_dir / "bin_qc.tsv",
         refine_actions_tsv=final_dir / "refine_actions.tsv",
+        refine_action_features_tsv=final_dir / "refine_action_features.tsv",
+        refine_action_scores_tsv=final_dir / "refine_action_scores.tsv",
+        refine_embedding_scores_tsv=final_dir / "refine_embedding_scores.tsv",
         refine_meta_json=final_dir / "refine_meta.json",
         export_meta_json=export_dir / "export_meta.json",
         bins_fasta_dir=export_dir / "bins_fasta",

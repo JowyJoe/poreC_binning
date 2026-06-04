@@ -44,6 +44,7 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
     unbinned = out_dir / "final" / "unbinned.tsv"
     bin_qc = out_dir / "final" / "bin_qc.tsv"
     refine_actions = out_dir / "final" / "refine_actions.tsv"
+    refine_action_features = out_dir / "final" / "refine_action_features.tsv"
     refine_meta = out_dir / "final" / "refine_meta.json"
 
     assert coarse_bins.exists()
@@ -52,6 +53,7 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
     assert unbinned.exists()
     assert bin_qc.exists()
     assert refine_actions.exists()
+    assert refine_action_features.exists()
     assert refine_meta.exists()
 
     coarse_rows = read_tsv_rows(coarse_bins)
@@ -91,6 +93,10 @@ def test_porebin_genome_bin_runs_coarse_and_refine_mvp(tmp_path: Path) -> None:
         "action_type\tcontig_id\tbin_id\tsource_bin\ttarget_bin\treason\taccepted\tconfidence\tdelta_contact\tscg_status\tnote"
     )
     assert "host" not in refine_actions.read_text(encoding="utf-8").lower()
+
+    feature_header = refine_action_features.read_text(encoding="utf-8").splitlines()[0]
+    assert feature_header.startswith("action_type\tcontig_id\tsource_bin\ttarget_bin\trule_reason")
+    assert "support_k_eff_median" in feature_header
 
     refine_meta_payload = read_json(refine_meta)
     assert refine_meta_payload["implemented"] is True
