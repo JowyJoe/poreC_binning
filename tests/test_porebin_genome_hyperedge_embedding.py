@@ -47,6 +47,57 @@ def _write_reassign_embedding(path: Path) -> Path:
     return path
 
 
+def test_feature_reconstruction_loss_balances_tnf_and_coverage() -> None:
+    torch = pytest.importorskip("torch", reason="torch required for HG-VAE loss unit test")
+
+    from porebin_genome.coarse.hyperedge_embedding import _torch_feature_reconstruction_loss
+
+    target = torch.zeros((2, 3), dtype=torch.float32)
+    reconstruction = torch.tensor([[2.0, 0.0, 4.0], [0.0, 0.0, 4.0]], dtype=torch.float32)
+    loss, tnf_loss, coverage_loss = _torch_feature_reconstruction_loss(
+        reconstruction=reconstruction,
+        target=target,
+        coverage_feature_present=True,
+    )
+
+    assert float(tnf_loss) == pytest.approx(1.0)
+    assert float(coverage_loss) == pytest.approx(16.0)
+    assert float(loss) == pytest.approx(8.5)
+
+
+def test_hypergraph_loss_full_batch_is_strength_weighted_average() -> None:
+    torch = pytest.importorskip("torch", reason="torch required for HG-VAE loss unit test")
+
+    import numpy as np
+
+    from porebin_genome.coarse.hyperedge_embedding import _TrainingEdge, _torch_hypergraph_loss
+
+    z = torch.tensor([[0.0], [2.0], [10.0], [12.0]], dtype=torch.float32)
+    edges = [
+        _TrainingEdge(
+            contact_id=0,
+            members=np.asarray([0, 1], dtype=np.int64),
+            alpha=np.asarray([0.5, 0.5], dtype=np.float32),
+            weight=3.0,
+            base_weight=3.0,
+            feature_dispersion=0.0,
+            feature_compatibility=1.0,
+        ),
+        _TrainingEdge(
+            contact_id=1,
+            members=np.asarray([2, 3], dtype=np.int64),
+            alpha=np.asarray([0.5, 0.5], dtype=np.float32),
+            weight=1.0,
+            base_weight=1.0,
+            feature_dispersion=0.0,
+            feature_compatibility=1.0,
+        ),
+    ]
+    loss = _torch_hypergraph_loss(z=z, edges=edges, batch_size=0, rng=np.random.default_rng(1))
+
+    assert float(loss) == pytest.approx(1.0)
+
+
 def test_hgvae_embedding_training_outputs_vectors(tmp_path: Path) -> None:
     pytest.importorskip("pyarrow", reason="pyarrow required for hyperedge embedding test")
     pytest.importorskip("torch", reason="torch required for HG-VAE embedding test")

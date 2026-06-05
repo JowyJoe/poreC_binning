@@ -312,29 +312,55 @@ z_i = Encoder(x_i)
 xhat_i = Decoder(z_i)
 ```
 
-The VAE must reconstruct the TNF/coverage feature vector:
+The VAE part uses two standard terms:
 
 ```text
-L_rec = mean_i ||x_i - xhat_i||^2
-L_kl  = mean_i KL(q(z_i | x_i) || N(0, I))
+L_feat  = 0.5 MSE(TNF, TNFhat) + 0.5 MSE(cov, covhat)
+L_prior = mean_i KL(q(z_i | x_i) || N(0, I))
 ```
 
-Each Pore-C contact remains a hyperedge. For hyperedge `e`:
+If coverage is not available, `L_feat` falls back to MSE over the available TNF/feature vector.
+
+Each Pore-C contact remains a hyperedge. We use one reusable quantity for a hyperedge's weighted dispersion:
 
 ```text
-mu_e = sum_i alpha_ie z_i
-xbar_e = sum_i alpha_ie x_i
-d_e  = sum_i alpha_ie ||x_i - xbar_e||^2
-g_e  = 1 / (1 + d_e / median_positive_d)
-L_hg = sum_e W_e g_e sum_i alpha_ie ||z_i - mu_e||^2
+Var_e(Y) = sum_i alpha_ie ||y_i - ybar_e||^2
+ybar_e   = sum_i alpha_ie y_i
 ```
 
-`L_rec` makes the ML representation learn TNF and coverage directly. `L_hg` uses high-order Pore-C contacts to pull compatible contigs together in latent space. `g_e` downweights contacts whose member contigs disagree in TNF/coverage, so contact evidence does not blindly override sequence/coverage evidence.
+This same definition is used twice:
+
+```text
+Var_e(X) = TNF/coverage disagreement inside contact e
+Var_e(Z) = latent-space disagreement inside contact e
+```
+
+The final contact strength is:
+
+```text
+s_e = W_e * c_e
+```
+
+where `W_e` is the hypergraph-native contact weight and `c_e` is the feature-compatibility factor:
+
+```text
+c_e = 1 / (1 + Var_e(X) / median_positive_VarX)
+```
+
+The hypergraph term is:
+
+```text
+L_contact = sum_e s_e Var_e(Z) / sum_e s_e
+```
+
+During minibatch training, hyperedges are sampled proportional to `s_e`, and the batch loss is the average `Var_e(Z)`. This keeps high-confidence contacts important without multiplying their influence twice.
+
+`L_feat` makes the ML representation learn TNF and coverage directly. `L_contact` uses high-order Pore-C contacts to pull compatible contigs together in latent space. `s_e` prevents contact evidence from blindly overriding sequence/coverage evidence.
 
 The total training objective is:
 
 ```text
-L = L_rec + beta * L_kl + lambda * L_hg
+L = L_feat + beta * L_prior + lambda * L_contact
 ```
 
 In HG-VAE mode, the resulting latent matrix is the coarse clustering surface:

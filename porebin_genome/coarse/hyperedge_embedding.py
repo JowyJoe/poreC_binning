@@ -44,6 +44,8 @@ class HyperedgeEmbeddingResult:
     epochs_completed: int
     final_loss: float | None
     reconstruction_loss: float | None
+    tnf_reconstruction_loss: float | None
+    coverage_reconstruction_loss: float | None
     kl_loss: float | None
     hypergraph_loss: float | None
     feature_guard_enabled: bool
@@ -122,7 +124,6 @@ def train_hyperedge_embedding(
         raise HyperedgeEmbeddingError("HG-VAE embedding requires numpy.") from exc
     try:
         import torch
-        import torch.nn.functional as F
     except Exception as exc:  # pragma: no cover
         raise HyperedgeEmbeddingError(
             "HG-VAE embedding requires PyTorch. Recreate the environment from environment.yml "
@@ -171,7 +172,7 @@ def train_hyperedge_embedding(
     optimizer = torch.optim.Adam(model.parameters(), lr=float(learning_rate))
     X = torch.as_tensor(X_np, dtype=torch.float32)
 
-    losses: list[dict[str, float | int]] = []
+    losses: list[dict[str, object]] = []
     best_state: dict[str, object] | None = None
     best_loss = math.inf
     stale_epochs = 0
@@ -181,7 +182,15 @@ def train_hyperedge_embedding(
         model.train()
         optimizer.zero_grad()
         reconstruction, mean, logvar = model(X)
-        reconstruction_loss = F.mse_loss(reconstruction, X, reduction="mean")
+        (
+            reconstruction_loss,
+            tnf_reconstruction_loss,
+            coverage_reconstruction_loss,
+        ) = _torch_feature_reconstruction_loss(
+            reconstruction=reconstruction,
+            target=X,
+            coverage_feature_present=bool(coverage_feature_present),
+        )
         kl_loss = -0.5 * torch.mean(torch.sum(1.0 + logvar - mean.pow(2) - logvar.exp(), dim=1))
         hg_loss = _torch_hypergraph_loss(
             z=mean,
@@ -202,6 +211,12 @@ def train_hyperedge_embedding(
             "epoch": int(epoch_idx + 1),
             "loss": float(total_loss.detach().cpu()),
             "reconstruction_loss": float(reconstruction_loss.detach().cpu()),
+            "tnf_reconstruction_loss": float(tnf_reconstruction_loss.detach().cpu()),
+            "coverage_reconstruction_loss": (
+                None
+                if coverage_reconstruction_loss is None
+                else float(coverage_reconstruction_loss.detach().cpu())
+            ),
             "kl_loss": float(kl_loss.detach().cpu()),
             "hypergraph_loss": float(hg_loss.detach().cpu()),
             "learning_rate": float(learning_rate),
@@ -239,6 +254,12 @@ def train_hyperedge_embedding(
         epochs_completed=epochs_completed,
         final_loss=(float(last["loss"]) if "loss" in last else None),
         reconstruction_loss=(float(last["reconstruction_loss"]) if "reconstruction_loss" in last else None),
+        tnf_reconstruction_loss=(
+            float(last["tnf_reconstruction_loss"]) if last.get("tnf_reconstruction_loss") is not None else None
+        ),
+        coverage_reconstruction_loss=(
+            float(last["coverage_reconstruction_loss"]) if last.get("coverage_reconstruction_loss") is not None else None
+        ),
         kl_loss=(float(last["kl_loss"]) if "kl_loss" in last else None),
         hypergraph_loss=(float(last["hypergraph_loss"]) if "hypergraph_loss" in last else None),
         feature_guard_enabled=bool(feature_guard),
@@ -341,6 +362,22 @@ def _build_hypergraph_vae(*, input_dim: int, hidden_dim: int, latent_dim: int):
 
 def _default_hidden_dim(*, input_dim: int, latent_dim: int) -> int:
     return int(max(64, min(512, max(int(input_dim), int(latent_dim)) * 2)))
+
+
+def _torch_feature_reconstruction_loss(
+    *,
+    reconstruction: object,
+    target: object,
+    coverage_feature_present: bool,
+) -> tuple[object, object, object | None]:
+    import torch.nn.functional as F
+
+    if bool(coverage_feature_present) and int(target.shape[1]) > 1:
+        tnf_loss = F.mse_loss(reconstruction[:, :-1], target[:, :-1], reduction="mean")
+        coverage_loss = F.mse_loss(reconstruction[:, -1:], target[:, -1:], reduction="mean")
+        return 0.5 * tnf_loss + 0.5 * coverage_loss, tnf_loss, coverage_loss
+    loss = F.mse_loss(reconstruction, target, reduction="mean")
+    return loss, loss, None
 
 
 def _load_training_edge_candidates(
@@ -456,7 +493,8 @@ def _torch_hypergraph_loss(*, z, edges: list[_TrainingEdge], batch_size: int, rn
     if not edges:
         return z.sum() * 0.0
 
-    if int(batch_size) > 0 and int(batch_size) < len(edges):
+    sampled_by_strength = int(batch_size) > 0 and int(batch_size) < len(edges)
+    if sampled_by_strength:
         weights = np.asarray([max(float(edge.weight), 0.0) for edge in edges], dtype=np.float64)
         total = float(weights.sum())
         probs = None if total <= 0.0 else weights / total
@@ -465,6 +503,7 @@ def _torch_hypergraph_loss(*, z, edges: list[_TrainingEdge], batch_size: int, rn
     else:
         selected = edges
 
+    dispersions = []
     terms = []
     weight_sum = 0.0
     for edge in selected:
@@ -473,8 +512,15 @@ def _torch_hypergraph_loss(*, z, edges: list[_TrainingEdge], batch_size: int, rn
         vectors = z.index_select(0, members)
         centroid = torch.sum(vectors * alpha[:, None], dim=0)
         dispersion = torch.sum(alpha * torch.sum((vectors - centroid) ** 2, dim=1))
+        dispersions.append(dispersion)
+        if sampled_by_strength:
+            continue
         terms.append(float(edge.weight) * dispersion)
         weight_sum += float(edge.weight)
+    if not dispersions:
+        return z.sum() * 0.0
+    if sampled_by_strength:
+        return torch.stack(dispersions).mean()
     if not terms or weight_sum <= 0.0:
         return z.sum() * 0.0
     return torch.stack(terms).sum() / float(weight_sum)
@@ -578,7 +624,7 @@ def _write_meta(
     feature_compatibility_scale: float | None,
     mean_feature_compatibility: float | None,
     seed: int,
-    losses: list[dict[str, float | int]],
+    losses: list[dict[str, object]],
     warning: str | None,
 ) -> None:
     method = (
@@ -601,14 +647,12 @@ def _write_meta(
         "formula": {
             "feature_input": "x_i = [TNF136_i, log1p(coverage_i)] after z-score normalization",
             "vae": "z_i = Encoder(x_i), xhat_i = Decoder(z_i)",
-            "reconstruction_loss": "L_rec = mean_i ||x_i - xhat_i||^2",
-            "kl_loss": "L_kl = mean_i KL(q(z_i|x_i) || N(0,I))",
-            "hyperedge_centroid": "mu_e = sum_i alpha_ie z_i",
-            "feature_centroid": "xbar_e = sum_i alpha_ie x_i",
-            "feature_dispersion": "d_e = sum_i alpha_ie ||x_i - xbar_e||^2",
-            "feature_compatibility": "g_e = 1 / (1 + d_e / median_positive_d)",
-            "hyperedge_loss": "L_hg = sum_e W_e g_e sum_i alpha_ie ||z_i - mu_e||^2",
-            "total_loss": "L = L_rec + beta_kl * L_kl + lambda_hypergraph * L_hg",
+            "feature_loss": "L_feat = 0.5 * MSE(TNF, TNFhat) + 0.5 * MSE(coverage, coveragehat) when coverage is present; otherwise MSE(X, Xhat)",
+            "prior_loss": "L_prior = mean_i KL(q(z_i|x_i) || N(0,I))",
+            "hyperedge_dispersion": "Var_e(Y) = sum_i alpha_ie ||y_i - ybar_e||^2; ybar_e = sum_i alpha_ie y_i",
+            "contact_strength": "s_e = W_e * c_e, where c_e = 1 / (1 + Var_e(X) / median_positive_VarX)",
+            "contact_loss": "L_contact = sum_e s_e Var_e(Z) / sum_e s_e; minibatches sample hyperedges proportional to s_e and average Var_e(Z)",
+            "total_loss": "L = L_feat + beta_kl * L_prior + lambda_hypergraph * L_contact",
         },
         "contact_weight_mode": str(contact_weight_mode),
         "hypergraph_weight_eta": float(hypergraph_weight_eta),
@@ -632,6 +676,8 @@ def _write_meta(
         "n_supported_contigs": int(result.n_supported_contigs),
         "final_loss": result.final_loss,
         "reconstruction_loss": result.reconstruction_loss,
+        "tnf_reconstruction_loss": result.tnf_reconstruction_loss,
+        "coverage_reconstruction_loss": result.coverage_reconstruction_loss,
         "kl_loss": result.kl_loss,
         "hypergraph_loss": result.hypergraph_loss,
         "losses": losses,
