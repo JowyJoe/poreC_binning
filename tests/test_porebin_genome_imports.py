@@ -18,6 +18,11 @@ def test_porebin_genome_imports_smoke() -> None:
     from porebin_genome.evidence.bam import BamEvidenceStats, bam_to_contact_evidence
     from porebin_genome.evidence.canonical import CanonicalContact, canonicalize_contact
     from porebin_genome.evidence.preflight import EvidencePreflightReport, run_evidence_preflight
+    from porebin_genome.evidence.scg import (
+        ContigScgProfile,
+        ensure_scg_toolchain_available,
+        load_scg_panel,
+    )
     from porebin_genome.evidence.tnf import TNF136_LIST, compute_tnf136_features
     from porebin_genome.export.orchestrate import ExportRunResult, export_final_results
     from porebin_genome.io.contracts import (
@@ -29,16 +34,18 @@ def test_porebin_genome_imports_smoke() -> None:
         REFINE_ACTIONS_COLUMNS,
         UNBINNED_COLUMNS,
     )
-    from porebin_genome.refine.actions import write_refine_actions_tsv
-    from porebin_genome.refine.coherence import BinCoherenceStat, compute_bin_coherence, delta_contact_coherence
-    from porebin_genome.refine.contact_evidence import BinContactEvidence, collect_contig_bin_evidence
-    from porebin_genome.refine.features import build_bin_feature_profiles, load_refine_feature_inputs
-    from porebin_genome.refine.hyperedge import HyperedgeRecord, HyperedgeStore, load_hyperedges
-    from porebin_genome.refine.local_graph import LocalPairGraph, project_local_pair_graph
-    from porebin_genome.refine.markers import ContigScgProfile, ensure_scg_toolchain_available
-    from porebin_genome.refine.merge import generate_merge_candidates
-    from porebin_genome.refine.models import RefineActionRow
-    from porebin_genome.refine.orchestrate import RefineRunResult, run_refinement
+    from porebin_genome.refinement import (
+        ActionEvaluator,
+        ActionPolicy,
+        generate_merge_candidates,
+    )
+    from porebin_genome.refinement.contact_index import ContactIndex
+    from porebin_genome.refinement.orchestrate import (
+        RefineRunResult,
+        run_refinement,
+    )
+    from porebin_genome.refinement.profiles import EvidenceProfileState
+    from porebin_genome.refinement.state import RefineState
 
     assert __version__
     assert app is not None
@@ -66,22 +73,14 @@ def test_porebin_genome_imports_smoke() -> None:
     assert CoarseRunResult.__name__ == "CoarseRunResult"
     assert callable(run_refinement)
     assert RefineRunResult.__name__ == "RefineRunResult"
-    assert RefineActionRow.__name__ == "RefineActionRow"
-    assert callable(write_refine_actions_tsv)
-    assert HyperedgeRecord.__name__ == "HyperedgeRecord"
-    assert HyperedgeStore.__name__ == "HyperedgeStore"
-    assert callable(load_hyperedges)
-    assert BinCoherenceStat.__name__ == "BinCoherenceStat"
-    assert callable(compute_bin_coherence)
-    assert callable(delta_contact_coherence)
-    assert BinContactEvidence.__name__ == "BinContactEvidence"
-    assert callable(collect_contig_bin_evidence)
-    assert callable(load_refine_feature_inputs)
-    assert callable(build_bin_feature_profiles)
-    assert LocalPairGraph.__name__ == "LocalPairGraph"
-    assert callable(project_local_pair_graph)
+    assert ContactIndex.__name__ == "ContactIndex"
+    assert RefineState.__name__ == "RefineState"
+    assert EvidenceProfileState.__name__ == "EvidenceProfileState"
+    assert ActionEvaluator.__name__ == "ActionEvaluator"
+    assert ActionPolicy.__name__ == "ActionPolicy"
     assert ContigScgProfile.__name__ == "ContigScgProfile"
     assert callable(ensure_scg_toolchain_available)
+    assert callable(load_scg_panel)
     assert callable(generate_merge_candidates)
     assert callable(export_final_results)
     assert ExportRunResult.__name__ == "ExportRunResult"

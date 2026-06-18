@@ -23,4 +23,6 @@ logs/
 Thumbs.db
 
 # documentation
-docs/
+docs/*
+!docs/REFINE_DESIGN.md
+!docs/ARCHITECTURE.md

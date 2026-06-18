@@ -2,6 +2,10 @@
 
 `porebin` is a genome-centric Pore-C metagenomic binning tool. It combines Pore-C contact evidence, sequence composition, and coverage to discover candidate genome bins, refine them into final genome bins, and keep unresolved contigs explicit.
 
+The refine redesign, formulas, evidence roles, performance constraints, and
+implementation sequence are specified in
+[`docs/REFINE_DESIGN.md`](docs/REFINE_DESIGN.md).
+
 ## Install
 
 ```bash
@@ -122,7 +126,6 @@ porebin bin \
   --contacts "$WORK/evidence_run/evidence/contacts.parquet" \
   --coverage-tsv "$WORK/evidence_run/evidence/coverage.tsv" \
   --coarse-method hgvae \
-  --embedding-scorer-mode report \
   --out "$WORK/hgvae_run"
 ```
 
@@ -190,6 +193,60 @@ mamba install -c conda-forge -c bioconda coverm
 - `prodigal`
 - `hmmsearch` from HMMER
 
+SCG refinement always uses the bundled `marker.hmm` and the fixed 107-marker
+order embedded in the package. There is no custom HMM or marker-manifest
+override.
+
+SCG evidence generation and refinement have separate ownership:
+
+```text
+porebin_genome/evidence/scg/  fixed panel, Prodigal/HMMER, parser, cache
+porebin_genome/refinement/    split, merge, recruit, QC, orchestration
+```
+
+There is no legacy `porebin_genome/refine/` package. SCG discovery produces
+contig-level marker evidence; the refinement engine consumes that evidence
+through its unified profile, evaluator, and ordered policy.
+
+The replacement currently contains the compact `ContactIndex`, versioned
+incremental `RefineState`, independent HG-VAE/TNF/log-coverage/SCG profiles,
+and the shared `Proposal -> ActionEvaluator -> ActionPolicy -> Decision`
+interface for `split`, `merge`, and `recruit`. Candidate actions update only
+incident hyperedges through exact `delta N` and `delta D` formulas, and profile
+evaluation rebuilds only affected bins.
+
+SCG-guided split candidate generation is implemented. For each bin with
+duplicated canonical SCGs, the most repeated marker supplies deterministic
+HG-VAE k-means seeds. The longest child retains the source bin ID; other
+children receive contiguous new IDs. Missing embeddings, identical seeds,
+empty children, or unseparated marker seeds produce explicit abstention.
+Candidate generation does not inspect Pore-C edges; the shared evaluator later
+checks local Pore-C separation and SCG/embedding improvement.
+
+Merge candidate generation is also implemented. It scans the current
+hyperedges once, accumulates bin-pair support
+`T(a,b)=sum_e r_e m_ea m_eb`, normalizes it by
+`sqrt(D[a]D[b]+eps)`, and proposes only mutual-best pairs supported by at
+least two hyperedges. Merge objects are complete non-empty bins with no SCG
+duplication and complete HG-VAE evidence. A merge is accepted only when it
+creates no duplicated SCG and the two robust HG-VAE regions overlap. Accepted
+mutual-best pairs are bin-disjoint and are committed together in one
+versioned assignment/contact/profile transaction.
+
+Recruit candidate generation is implemented for current unbinned contigs
+only. Pore-C support from incident hyperedges selects one target, while HG-VAE
+distance independently selects the nearest stable bin. A proposal exists only
+when the two targets agree; contact ties, latent ties, unstable targets,
+missing embeddings, and insufficient support produce explicit abstention.
+Accepted recruits are applied one at a time, and later candidates are refreshed
+locally after state changes so SCG and bin-profile evidence remain current.
+
+The replacement policy uses four ordered gates: structural validity, SCG
+safety, Pore-C support, and HG-VAE compatibility. TNF and coverage remain in
+bin profiles and final QC but are not repeated per-action gates. There is no
+independent reassign/release stage and no opaque action classifier in the new
+mainline. The public CLI runs this replacement policy directly.
+
 If either tool is missing, refine will raise an explicit dependency error. For development or testing runs where SCG veto is intentionally disabled, use `--disable-scg`.
 
 Install these command-line tools with conda:
@@ -226,6 +283,7 @@ contigs.fasta + contacts.parquet + coverage.tsv
   -> final/unbinned.tsv
   -> final/bin_qc.tsv
   -> final/refine_actions.tsv
+  -> final/refine_stage_log.jsonl
   -> final/refine_meta.json
 ```
 
@@ -241,13 +299,6 @@ Optional audit and comparison outputs may also be written when their flags are e
 --hyperedge-embedding
   -> coarse/hyperedge_embedding.tsv
   -> coarse/hyperedge_embedding_meta.json
-
---action-scorer-mode features-only|score
-  -> final/refine_action_features.tsv
-  -> final/refine_action_scores.tsv  # only with score mode
-
---embedding-scorer-mode report|veto
-  -> final/refine_embedding_scores.tsv
 ```
 
 ## Method summary
@@ -286,6 +337,10 @@ The legacy mode `--contact-weight-mode original` is still available for ablation
 ```text
 W_e = q_e / (k_valid - 1)
 ```
+
+The replacement `refinement/ContactIndex` does not expose this ablation
+branch: it always caches the hypergraph-native weight shown above.
+`--contact-weight-mode original` affects coarse ablation runs only.
 
 ### Pairwise baseline
 
@@ -369,21 +424,28 @@ In HG-VAE mode, the resulting latent matrix is the coarse clustering surface:
 Z_hgvae -> HDBSCAN -> coarse/bins.tsv
 ```
 
-The same `coarse/hyperedge_embedding.tsv` can also be reused by `--embedding-scorer-mode report|veto` during refinement.
+The same `coarse/hyperedge_embedding.tsv` is used directly by replacement
+refine for HG-VAE compatibility checks.
 
-### Conservative refine scoring
+### Replacement refine design
 
-Refinement still begins with rule-based candidate actions:
+The replacement refine mainline is:
 
 ```text
-split -> reassign -> merge -> recruit
+SCG-guided split -> conservative merge -> Pore-C/HG-VAE agreement recruit
 ```
 
-The optional action and embedding scorers are conservative audit layers:
+Its action logic is intentionally small:
 
-- they never revive a rule-rejected action
-- in `score` or `veto` mode, they may veto an action already accepted by the rules
-- in report-only modes, they write diagnostics without changing assignments
+- duplicated canonical SCGs trigger split diagnosis
+- HG-VAE proposes or validates latent compatibility
+- original Pore-C hyperedges verify local structural support
+- merge and recruit cannot create a new duplicated SCG marker
+- missing or contradictory evidence leaves the assignment unchanged
+
+The replacement mainline has no action classifier or secondary embedding
+scorer. It records the direct ordered-gate evidence for every considered
+action.
 
 ## Recommended workflow
 
@@ -429,13 +491,12 @@ porebin bin \
   --pairwise-baseline \
   --out run_out
 
-# train feature-anchored HG-VAE embeddings and report refine embedding scores
+# train feature-anchored HG-VAE embeddings for replacement refine
 porebin bin \
   --contigs contigs.fasta \
   --contacts run_out/evidence/contacts.parquet \
   --coverage-tsv run_out/evidence/coverage.tsv \
   --hyperedge-embedding \
-  --embedding-scorer-mode report \
   --out run_out
 
 # run the complete HG-VAE coarse route
@@ -444,7 +505,6 @@ porebin bin \
   --contacts run_out/evidence/contacts.parquet \
   --coverage-tsv run_out/evidence/coverage.tsv \
   --coarse-method hgvae \
-  --embedding-scorer-mode report \
   --out run_out
 
 # optionally disable internal SCG veto for environments without prodigal/hmmsearch
@@ -475,7 +535,10 @@ When `--pairwise-baseline` is enabled, `coarse/bins.pairwise_leiden.tsv` contain
 
 ### `coarse/hyperedge_embedding.tsv`
 
-When `--hyperedge-embedding` is enabled, this file contains feature-anchored HG-VAE latent vectors for contigs. The model learns from TNF/coverage reconstruction and Pore-C hyperedge regularization. These embeddings may be used by the optional refine embedding scorer.
+When `--hyperedge-embedding` is enabled, this file contains feature-anchored
+HG-VAE latent vectors for contigs. The model learns from TNF/coverage
+reconstruction and Pore-C hyperedge regularization. Replacement refine uses
+these vectors directly.
 
 This file is written automatically when `--coarse-method hgvae` is used.
 
@@ -498,23 +561,19 @@ Contigs that remain unresolved after refinement, with explicit stage and reason.
 
 ### `final/refine_actions.tsv`
 
-Accepted and rejected refine actions for split, reassign, merge, and recruit, including per-action `delta_contact` and compact `scg_status`.
+Accepted, rejected, and abstained split, merge, and recruit records. Each row
+keeps direct gate evidence in `note`; there is no combined confidence score.
 
-### `final/refine_action_features.tsv`
+### `final/refine_stage_log.jsonl`
 
-Candidate-action feature table for audit or model training. It is written by default with `--action-scorer-mode features-only`.
-
-### `final/refine_action_scores.tsv`
-
-Action scorer decisions when `--action-scorer-mode score` is used with a model directory.
-
-### `final/refine_embedding_scores.tsv`
-
-Embedding scorer diagnostics when `--embedding-scorer-mode report` or `veto` is used.
+Immediately flushed stage records for input validation, SCG, initialization,
+split, merge, recruit, finalization, completion, and errors. This is a
+progress log only. Refine writes no checkpoint or resumable assignment state.
 
 ### `final/refine_meta.json`
 
-Stage-level counts for suspect bins, split/reassign/recruit candidates, accepted actions, rejected actions, and final unbinned contigs.
+Stage-level engine identity, candidate/action counts, evidence settings, and
+final unbinned counts.
 
 ## Method boundaries
 
@@ -522,7 +581,8 @@ Stage-level counts for suspect bins, split/reassign/recruit candidates, accepted
 - the pairwise Leiden baseline is a separate comparison route and does not feed pairwise weights into the hypergraph main method
 - the default hypergraph main method uses only Pore-C hyperedge-native quantities (`q_e`, `alpha_ie`, `k_eff`) for contact weights
 - HG-VAE learns TNF/coverage directly and uses Pore-C contacts as hypergraph regularization; in `--coarse-method hgvae`, that latent space directly drives HDBSCAN coarse clustering
-- refine is genome-centric and does not use host-centric semantics
+- replacement refine uses only split, merge, and recruit with ordered SCG, Pore-C, and HG-VAE evidence
+- candidate actions must use incident-edge indexes instead of rescanning all hyperedges
 - unresolved contigs remain explicit instead of being forced into bins
 - SCG veto is enabled by default in refine and requires external `prodigal` and `hmmsearch`
 

@@ -69,6 +69,24 @@ def test_porebin_genome_contract_validators(tmp_path: Path) -> None:
     assert all("host" not in column.lower() for column in BIN_QC_COLUMNS)
 
     refine_actions = tmp_path / "refine_actions.tsv"
-    write_tsv_rows(refine_actions, REFINE_ACTIONS_COLUMNS, [("reassign", "c1", "", "0", "1", "move_to_target_bin", 1, 0.9, 0.2, "abstain", "accepted")])
+    write_tsv_rows(
+        refine_actions,
+        REFINE_ACTIONS_COLUMNS,
+        [
+            (
+                "recruit",
+                "c1",
+                "",
+                "",
+                "1",
+                "accepted",
+                1,
+                0.9,
+                0.2,
+                "pass",
+                "accepted",
+            )
+        ],
+    )
     validate_tsv_header(refine_actions, REFINE_ACTIONS_COLUMNS)
     assert all("host" not in column.lower() for column in REFINE_ACTIONS_COLUMNS)

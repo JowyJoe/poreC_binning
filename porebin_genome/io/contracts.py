@@ -97,9 +97,7 @@ class PipelineLayout:
     unbinned_tsv: Path
     bin_qc_tsv: Path
     refine_actions_tsv: Path
-    refine_action_features_tsv: Path
-    refine_action_scores_tsv: Path
-    refine_embedding_scores_tsv: Path
+    refine_stage_log_jsonl: Path
     refine_meta_json: Path
     export_meta_json: Path
     bins_fasta_dir: Path
@@ -139,9 +137,7 @@ def build_pipeline_layout(out_dir: Path) -> PipelineLayout:
         unbinned_tsv=final_dir / "unbinned.tsv",
         bin_qc_tsv=final_dir / "bin_qc.tsv",
         refine_actions_tsv=final_dir / "refine_actions.tsv",
-        refine_action_features_tsv=final_dir / "refine_action_features.tsv",
-        refine_action_scores_tsv=final_dir / "refine_action_scores.tsv",
-        refine_embedding_scores_tsv=final_dir / "refine_embedding_scores.tsv",
+        refine_stage_log_jsonl=final_dir / "refine_stage_log.jsonl",
         refine_meta_json=final_dir / "refine_meta.json",
         export_meta_json=export_dir / "export_meta.json",
         bins_fasta_dir=export_dir / "bins_fasta",

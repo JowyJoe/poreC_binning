@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.porebin_genome_testkit import read_json, read_tsv_rows, write_dual_community_fixture, write_reassign_refine_fixture
+from tests.porebin_genome_testkit import (
+    read_json,
+    read_tsv_rows,
+    write_dual_community_fixture,
+)
 
 
 def _write_feature_guard_fixture(tmp_path: Path) -> dict[str, Path]:
@@ -26,25 +30,6 @@ def _write_feature_guard_fixture(tmp_path: Path) -> dict[str, Path]:
         contacts,
     )
     return {"contacts": contacts}
-
-
-def _write_reassign_embedding(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "\n".join(
-            [
-                "contig_id\tz0\tz1\tsupport_weight",
-                "a\t1\t0\t10",
-                "b\t1\t0\t10",
-                "c\t0\t1\t10",
-                "d\t0\t1\t10",
-                "e\t1\t0\t10",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return path
 
 
 def test_feature_reconstruction_loss_balances_tnf_and_coverage() -> None:
@@ -209,60 +194,3 @@ def test_hgvae_can_drive_coarse_clustering(tmp_path: Path) -> None:
     assert coarse_run["embedding_source"] == "hgvae"
     assert coarse_run["hyperedge_embedding_enabled"] is True
     assert coarse_run["lambda_contact"] is None
-
-
-def test_embedding_report_scores_without_changing_reassign(tmp_path: Path) -> None:
-    pytest.importorskip("pyarrow", reason="pyarrow required for embedding scorer integration test")
-
-    from porebin_genome.refine.orchestrate import run_refinement
-
-    fixture = write_reassign_refine_fixture(tmp_path)
-    embedding_tsv = _write_reassign_embedding(tmp_path / "embedding.tsv")
-    result = run_refinement(
-        contigs_fasta=fixture["contigs"],
-        coarse_bins_tsv=fixture["coarse_bins"],
-        contacts_parquet=fixture["contacts"],
-        coverage_tsv=fixture["coverage"],
-        enable_scg=False,
-        embedding_scorer_mode="report",
-        embedding_tsv=embedding_tsv,
-        out_dir=tmp_path / "out",
-    )
-
-    assignment = {row["contig_id"]: row["bin_id"] for row in read_tsv_rows(result.bins_refined_tsv)}
-    scores = read_tsv_rows(result.refine_embedding_scores_tsv)
-    reassign_scores = [row for row in scores if row["action_type"] == "reassign" and row["contig_id"] == "e"]
-
-    assert assignment["e"] == assignment["c"]
-    assert reassign_scores
-    assert reassign_scores[0]["embedding_decision"] == "would_veto"
-    assert reassign_scores[0]["final_accepted"] == "1"
-
-
-def test_embedding_veto_blocks_low_margin_reassign(tmp_path: Path) -> None:
-    pytest.importorskip("pyarrow", reason="pyarrow required for embedding scorer integration test")
-
-    from porebin_genome.refine.orchestrate import run_refinement
-
-    fixture = write_reassign_refine_fixture(tmp_path)
-    embedding_tsv = _write_reassign_embedding(tmp_path / "embedding.tsv")
-    result = run_refinement(
-        contigs_fasta=fixture["contigs"],
-        coarse_bins_tsv=fixture["coarse_bins"],
-        contacts_parquet=fixture["contacts"],
-        coverage_tsv=fixture["coverage"],
-        enable_scg=False,
-        embedding_scorer_mode="veto",
-        embedding_tsv=embedding_tsv,
-        out_dir=tmp_path / "out",
-    )
-
-    assignment = {row["contig_id"]: row["bin_id"] for row in read_tsv_rows(result.bins_refined_tsv)}
-    actions = read_tsv_rows(result.refine_actions_tsv)
-    scores = read_tsv_rows(result.refine_embedding_scores_tsv)
-    meta = read_json(result.refine_meta_json)
-
-    assert assignment["e"] == "0"
-    assert any(row["reason"] == "embedding_veto_low_margin" for row in actions if row["action_type"] == "reassign")
-    assert any(row["embedding_decision"] == "veto" for row in scores if row["action_type"] == "reassign")
-    assert meta["n_embedding_veto_actions"] >= 1

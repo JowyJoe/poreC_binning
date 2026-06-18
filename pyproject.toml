@@ -44,3 +44,8 @@ porebin-genome = "porebin_genome.cli:app"
 
 [tool.setuptools.packages.find]
 include = ["porebin_genome*"]
+
+[tool.setuptools.package-data]
+porebin_genome = [
+  "evidence/scg/*.hmm",
+]
