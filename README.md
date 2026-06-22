@@ -139,32 +139,7 @@ porebin export \
   --bins-refined-tsv "$WORK/hgvae_run/final/bins.refined.tsv" \
   --unbinned-tsv "$WORK/hgvae_run/final/unbinned.tsv" \
   --out "$WORK/hgvae_export"
-```
 
-Inspect key outputs:
-
-```bash
-python - <<PY
-import json
-from pathlib import Path
-
-root = Path("$WORK")
-for name in ("spectral_run", "hgvae_run"):
-    coarse = json.loads((root / name / "coarse" / "run.json").read_text())
-    refine = json.loads((root / name / "final" / "refine_meta.json").read_text())
-    print(name)
-    print("  coarse_method:", coarse.get("coarse_method"))
-    print("  n_bins:", coarse.get("n_bins"))
-    print("  n_contigs_clustered:", coarse.get("n_contigs_clustered"))
-    print("  n_contigs_unbinned:", coarse.get("n_contigs_unbinned"))
-    print("  final_n_bins:", refine.get("n_bins_out"))
-    print("  final_unbinned:", refine.get("n_unbinned_final"))
-PY
-
-ls "$WORK/hgvae_run/coarse"
-ls "$WORK/hgvae_run/final"
-ls "$WORK/hgvae_export/export"
-```
 
 ### External command-line dependencies
 
