@@ -8,7 +8,7 @@ from enum import Enum
 
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.utils.fixes import threadpool_limits
+from threadpoolctl import threadpool_limits
 
 from porebin_genome.refinement.actions import ActionType, Proposal
 from porebin_genome.refinement.profiles import EvidenceProfileState

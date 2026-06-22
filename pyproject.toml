@@ -16,6 +16,7 @@ dependencies = [
   "numpy>=1.23",
   "scipy>=1.10",
   "scikit-learn>=1.2",
+  "threadpoolctl>=3.0",
   "hdbscan>=0.8",
   "igraph>=1.0",
   "leidenalg>=0.11",

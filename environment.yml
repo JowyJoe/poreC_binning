@@ -10,6 +10,7 @@ dependencies:
   - pysam
   - scipy
   - scikit-learn
+  - threadpoolctl>=3.0
   - hdbscan
   - typer>=0.12
   - igraph>=1.0
