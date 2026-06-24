@@ -8,6 +8,7 @@ from porebin_genome.evidence.scg.discovery import (
     ScgHit,
     collapse_scg_hits_to_contigs,
     ensure_scg_toolchain_available,
+    parse_scg_hits,
     prepare_scg_profiles,
 )
 
@@ -83,6 +84,44 @@ def test_collapse_scg_hits_canonicalizes_aliases_before_deduplication() -> None:
     assert profiles["c1"].marker_ids == ("TIGR00389",)
     assert profiles["c1"].n_markers == 1
     assert profiles["c1"].marker_orf_counts == {"TIGR00389": 2}
+
+
+def test_parse_scg_hits_maps_prodigal_faa_orf_id_to_gff_contig(
+    tmp_path: Path,
+) -> None:
+    prodigal_gff = tmp_path / "orfs.gff"
+    domtblout = tmp_path / "raw_hits.domtblout"
+    prodigal_gff.write_text(
+        "\n".join(
+            [
+                "##gff-version 3",
+                (
+                    "s228.ctg000409l\tProdigal_v2.6.3\tCDS\t259779\t260963"
+                    "\t.\t-\t0\tID=409_287;partial=00"
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    domtblout.write_text(
+        _domtblout_line(
+            orf_id="s228.ctg000409l_287",
+            marker_id="PGK",
+        ),
+        encoding="utf-8",
+    )
+
+    hits = parse_scg_hits(
+        domtblout_tsv=domtblout,
+        prodigal_gff=prodigal_gff,
+        domain="bacteria",
+    )
+
+    assert len(hits) == 1
+    assert hits[0].orf_id == "s228.ctg000409l_287"
+    assert hits[0].contig_id == "s228.ctg000409l"
+    assert hits[0].marker_id == "PGK"
 
 
 def test_scg_cache_reuses_orfs_hmmsearch_and_parser(

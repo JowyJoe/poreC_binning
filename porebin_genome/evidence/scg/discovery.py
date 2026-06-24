@@ -19,7 +19,7 @@ from porebin_genome.io.runtime import ensure_dir, write_json
 
 MIN_HMM_COVERAGE = 0.40
 SCG_CACHE_SCHEMA_VERSION = 1
-SCG_PARSER_SCHEMA_VERSION = 2
+SCG_PARSER_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -519,6 +519,9 @@ def _parse_prodigal_gff_orf_map(prodigal_gff: Path) -> dict[str, str]:
             orf_id = str(attributes.get("ID", "")).strip()
             if contig_id and orf_id:
                 out[orf_id] = contig_id
+                suffix = orf_id.rsplit("_", 1)[-1]
+                if suffix and suffix != orf_id:
+                    out[f"{contig_id}_{suffix}"] = contig_id
     return out
 
 
