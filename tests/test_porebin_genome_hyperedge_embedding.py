@@ -192,5 +192,46 @@ def test_hgvae_can_drive_coarse_clustering(tmp_path: Path) -> None:
     assert result.n_bins >= 1
     assert coarse_run["coarse_method"] == "hgvae"
     assert coarse_run["embedding_source"] == "hgvae"
+    assert coarse_run["coarse_embedding_source"] == "hgvae"
+    assert coarse_run["hgvae_role"] == "experimental_coarse"
+    assert coarse_run["refine_embedding_source"] == "hgvae"
     assert coarse_run["hyperedge_embedding_enabled"] is True
     assert coarse_run["lambda_contact"] is None
+
+
+def test_hgvae_embedding_can_support_spectral_coarse_refine(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow", reason="pyarrow required for spectral + HG-VAE test")
+    pytest.importorskip("hdbscan", reason="hdbscan required for spectral + HG-VAE test")
+    pytest.importorskip("torch", reason="torch required for HG-VAE embedding test")
+
+    from porebin_genome.coarse.orchestrate import run_coarse_discovery
+
+    fixture = write_dual_community_fixture(tmp_path, community_size=4)
+    result = run_coarse_discovery(
+        contigs_fasta=fixture["contigs"],
+        contacts_parquet=fixture["contacts"],
+        coverage_tsv=fixture["coverage"],
+        out_dir=tmp_path / "out",
+        coarse_method="spectral",
+        feature_knn_k=2,
+        run_hyperedge_embedding=True,
+        hyperedge_embedding_dim=8,
+        hyperedge_embedding_epochs=5,
+        hyperedge_vae_batch_size=0,
+        hdbscan_min_cluster_size=2,
+        seed=13,
+    )
+    coarse_run = read_json(result.run_json)
+
+    assert result.hyperedge_embedding_tsv is not None
+    assert result.hyperedge_embedding_tsv.exists()
+    assert coarse_run["coarse_method"] == "spectral"
+    assert coarse_run["embedding_source"] == "joint_spectral"
+    assert coarse_run["coarse_embedding_source"] == "joint_spectral"
+    assert coarse_run["hgvae_role"] == "refine_embedding"
+    assert coarse_run["refine_embedding_source"] == "hgvae"
+    assert coarse_run["hyperedge_embedding_enabled"] is True
+    assert coarse_run["hyperedge_embedding_requested"] is True
+    assert coarse_run["lambda_contact"] == 0.5

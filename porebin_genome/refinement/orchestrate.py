@@ -931,7 +931,60 @@ def _decision_details(
             "new_duplicate_markers": scg.new_duplicate_markers,
             "resolved_duplicate_markers": scg.resolved_duplicate_markers,
         }
+    embedding_details = _embedding_decision_details(decision)
+    if embedding_details:
+        details["embedding"] = embedding_details
     return details
+
+
+def _embedding_decision_details(decision: Decision) -> dict[str, Any]:
+    evidence = decision.evidence
+    contig = evidence.contig_embedding
+    if contig is not None:
+        inside_radius = None
+        if contig.distance is not None and contig.target_radius is not None:
+            inside_radius = bool(contig.distance <= contig.target_radius)
+        return {
+            "type": "recruit_contig_to_bin",
+            "rule": "distance <= target_radius",
+            "contig_idx": contig.contig_idx,
+            "target_bin": contig.target_bin_idx,
+            "distance": contig.distance,
+            "target_radius": contig.target_radius,
+            "inside_radius": inside_radius,
+        }
+
+    pair = evidence.bin_pair_embedding
+    if pair is not None:
+        regions_overlap = None
+        if pair.centroid_distance is not None and pair.combined_radius is not None:
+            regions_overlap = bool(
+                pair.centroid_distance <= pair.combined_radius
+            )
+        return {
+            "type": "merge_bin_regions",
+            "rule": "centroid_distance <= source_radius + target_radius",
+            "source_bin": pair.source_bin_idx,
+            "target_bin": pair.target_bin_idx,
+            "centroid_distance": pair.centroid_distance,
+            "source_radius": pair.source_radius,
+            "target_radius": pair.target_radius,
+            "combined_radius": pair.combined_radius,
+            "regions_overlap": regions_overlap,
+        }
+
+    metric = evidence.embedding
+    if metric is not None:
+        return {
+            "type": "split_embedding_dispersion",
+            "rule": "after median dispersion should not worsen",
+            "before": metric.before,
+            "after": metric.after,
+            "relative_gain": metric.relative_gain,
+            "observed_before": metric.observed_before,
+            "observed_after": metric.observed_after,
+        }
+    return {}
 
 
 def _split_details(candidate: SplitCandidate) -> dict[str, Any]:
@@ -956,10 +1009,34 @@ def _merge_details(candidate: MergeCandidate) -> dict[str, Any]:
 
 
 def _recruit_details(candidate: RecruitCandidate) -> dict[str, Any]:
+    target_agreement = None
+    if (
+        candidate.contact_target_bin_idx is not None
+        and candidate.latent_target_bin_idx is not None
+    ):
+        target_agreement = (
+            candidate.contact_target_bin_idx == candidate.latent_target_bin_idx
+        )
     return {
+        "note_schema_version": 2,
         "status": candidate.status.value,
         "reason": candidate.reason,
+        "selector": (
+            "porec_best_target_and_hgvae_min_radius_normalized_score"
+        ),
         "contig_idx": candidate.contig_idx,
+        "target_agreement": target_agreement,
+        "porec_target_bin": candidate.contact_target_bin_idx,
+        "porec_support": candidate.target_support,
+        "porec_runner_up_support": candidate.runner_up_support,
+        "porec_target_share": candidate.target_share,
+        "porec_target_margin": candidate.target_margin,
+        "porec_supporting_edges": candidate.target_edge_count,
+        "hgvae_target_bin": candidate.latent_target_bin_idx,
+        "hgvae_target_distance": candidate.latent_distance,
+        "hgvae_target_score": candidate.latent_score,
+        "hgvae_target_radius": candidate.target_radius,
+        "hgvae_score_formula": "latent_distance/(target_radius+eps)",
         "contact_target_bin": candidate.contact_target_bin_idx,
         "latent_target_bin": candidate.latent_target_bin_idx,
         "target_support": candidate.target_support,
@@ -968,7 +1045,30 @@ def _recruit_details(candidate: RecruitCandidate) -> dict[str, Any]:
         "target_margin": candidate.target_margin,
         "supporting_edge_count": candidate.target_edge_count,
         "latent_distance": candidate.latent_distance,
+        "latent_score": candidate.latent_score,
         "target_radius": candidate.target_radius,
+    }
+
+
+def _embedding_evidence_meta(embedding_tsv: Path | None) -> dict[str, Any]:
+    enabled = embedding_tsv is not None
+    return {
+        "enabled": bool(enabled),
+        "source": "hgvae" if enabled else None,
+        "role": (
+            "similarity_evidence"
+            if enabled
+            else "unavailable"
+        ),
+        "split_use": "duplicated_SCG_seeded_HG-VAE_kmeans",
+        "merge_rule": "centroid_distance <= source_radius + target_radius",
+        "recruit_selector": (
+            "Pore-C best target must match the HG-VAE target with minimum "
+            "radius-normalized score"
+        ),
+        "recruit_score_formula": "latent_distance/(target_radius+eps)",
+        "recruit_policy_rule": "latent_distance <= target_radius",
+        "action_note_schema_version": 2,
     }
 
 
@@ -1050,6 +1150,14 @@ def _build_refine_meta(
             "embedding_tsv": (
                 str(embedding_tsv) if embedding_tsv is not None else None
             ),
+            "refine_embedding_source": (
+                "hgvae" if embedding_tsv is not None else None
+            ),
+            "embedding_role": (
+                "hgvae_similarity_evidence"
+                if embedding_tsv is not None
+                else "unavailable"
+            ),
             "contact_weight_mode": "hypergraph_native",
             "hypergraph_weight_eta": hypergraph_weight_eta,
         },
@@ -1069,6 +1177,7 @@ def _build_refine_meta(
             ),
         },
         "stage_order": ["split", "merge", "recruit"],
+        "embedding_evidence": _embedding_evidence_meta(embedding_tsv),
         "stage_counts": stage_counts,
         "stage_durations_seconds": dict(stage_durations),
         "n_bins_in": int(n_bins_in),

@@ -14,6 +14,8 @@ def test_porebin_genome_cli_help_smoke() -> None:
     assert "evidence" in result.stdout
     assert "bin" in result.stdout
     assert "export" in result.stdout
+    assert "spectral" in result.stdout
+    assert "HG-VAE" in result.stdout
     assert "host" not in result.stdout.lower()
 
     evidence_help = runner.invoke(app, ["evidence", "--help"])
@@ -28,7 +30,13 @@ def test_porebin_genome_cli_help_smoke() -> None:
     assert "--contacts" in bin_help.stdout
     assert "--coverage-tsv" in bin_help.stdout
     assert "--knn-k" in bin_help.stdout
+    assert "hyperedge" in bin_help.stdout.lower()
+    assert "HG-VAE" in bin_help.stdout
     assert "adaptive" in bin_help.stdout
+    assert "stable" in bin_help.stdout
+    assert "recommended" in bin_help.stdout
+    assert "experimental" in bin_help.stdout
+    assert "similarity" in bin_help.stdout
     assert "candidate genome-bin discovery" in bin_help.stdout.lower() or "refinement" in bin_help.stdout.lower()
     assert "placeholder" not in bin_help.stdout.lower()
     assert "host" not in bin_help.stdout.lower()

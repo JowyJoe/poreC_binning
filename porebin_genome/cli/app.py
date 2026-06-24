@@ -33,7 +33,10 @@ app.command(
 )(evidence_command)
 app.command(
     "bin",
-    help="Run candidate genome-bin discovery followed by genome-bin refinement.",
+    help=(
+        "Run binning and refinement. Recommended mainline: spectral coarse "
+        "plus HG-VAE embedding evidence."
+    ),
 )(bin_command)
 app.command(
     "export",

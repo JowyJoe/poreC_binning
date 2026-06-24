@@ -65,6 +65,9 @@ def test_coarse_run_json_contains_required_collapse_audit_fields(tmp_path: Path)
         "feature_mode",
         "contact_hyperedge_count",
         "feature_knn_k",
+        "coarse_embedding_source",
+        "refine_embedding_source",
+        "hgvae_role",
     ):
         assert key in coarse_run
 

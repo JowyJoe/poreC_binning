@@ -82,6 +82,7 @@ class RecruitCandidate:
     target_margin: float | None = None
     target_edge_count: int = 0
     latent_distance: float | None = None
+    latent_score: float | None = None
     target_radius: float | None = None
     proposal: Proposal | None = None
 
@@ -272,11 +273,17 @@ def generate_recruit_candidate(
             target_edge_count=contact_best.edge_count,
         )
 
-    latent_target, latent_distance, latent_tied = _nearest_latent_target(
+    (
+        latent_target,
+        latent_distance,
+        latent_score,
+        latent_tied,
+    ) = _nearest_latent_target(
         contig_idx=contig_idx,
         eligible_bin_indices=eligible,
         profiles=profiles,
         tie_tolerance=resolved.tie_tolerance,
+        eps=resolved.eps,
     )
     if latent_tied:
         return _abstain(
@@ -290,6 +297,7 @@ def generate_recruit_candidate(
             target_margin=target_margin,
             target_edge_count=contact_best.edge_count,
             latent_distance=latent_distance,
+            latent_score=latent_score,
         )
     if latent_target != contact_best.bin_idx:
         return _abstain(
@@ -303,9 +311,8 @@ def generate_recruit_candidate(
             target_margin=target_margin,
             target_edge_count=contact_best.edge_count,
             latent_distance=latent_distance,
-            target_radius=profiles.profile(
-                contact_best.bin_idx
-            ).embedding.radius,
+            latent_score=latent_score,
+            target_radius=profiles.profile(latent_target).embedding.radius,
         )
 
     target_radius = profiles.profile(latent_target).embedding.radius
@@ -335,6 +342,7 @@ def generate_recruit_candidate(
         target_margin=target_margin,
         target_edge_count=int(contact_best.edge_count),
         latent_distance=latent_distance,
+        latent_score=latent_score,
         target_radius=target_radius,
         proposal=proposal,
     )
@@ -441,34 +449,36 @@ def _nearest_latent_target(
     eligible_bin_indices: tuple[int, ...],
     profiles: EvidenceProfileState,
     tie_tolerance: float,
-) -> tuple[int, float, bool]:
+    eps: float,
+) -> tuple[int, float, float, bool]:
     embedding = profiles.inputs.embedding
     if embedding is None:
         raise ValueError("HG-VAE embedding is unavailable.")
     vector = embedding[contig_idx]
-    distances = tuple(
-        (
-            bin_idx,
-            float(
-                np.linalg.norm(
-                    vector - profiles.profile(bin_idx).embedding.centroid
-                )
-            ),
-        )
-        for bin_idx in eligible_bin_indices
+    entries: list[tuple[int, float, float]] = []
+    for bin_idx in eligible_bin_indices:
+        profile = profiles.profile(bin_idx).embedding
+        if profile.centroid is None or profile.radius is None:
+            continue
+        distance = float(np.linalg.norm(vector - profile.centroid))
+        score = float(distance / (float(profile.radius) + float(eps)))
+        entries.append((bin_idx, distance, score))
+    ranked = tuple(
+        sorted(entries, key=lambda item: (item[2], item[1], item[0]))
     )
-    ranked = tuple(sorted(distances, key=lambda item: (item[1], item[0])))
-    best_bin, best_distance = ranked[0]
+    if not ranked:
+        raise ValueError("No eligible HG-VAE target bins are available.")
+    best_bin, best_distance, best_score = ranked[0]
     tied = sum(
         math.isclose(
-            distance,
-            best_distance,
+            score,
+            best_score,
             rel_tol=0.0,
             abs_tol=tie_tolerance,
         )
-        for _bin_idx, distance in ranked
+        for _bin_idx, _distance, score in ranked
     ) > 1
-    return best_bin, best_distance, tied
+    return best_bin, best_distance, best_score, tied
 
 
 def _candidate_priority(candidate: RecruitCandidate) -> tuple[float, int, int]:
@@ -491,6 +501,7 @@ def _abstain(
     target_margin: float | None = None,
     target_edge_count: int = 0,
     latent_distance: float | None = None,
+    latent_score: float | None = None,
     target_radius: float | None = None,
 ) -> RecruitCandidate:
     return RecruitCandidate(
@@ -505,6 +516,7 @@ def _abstain(
         target_margin=target_margin,
         target_edge_count=target_edge_count,
         latent_distance=latent_distance,
+        latent_score=latent_score,
         target_radius=target_radius,
     )
 

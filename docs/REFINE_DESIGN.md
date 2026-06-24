@@ -50,8 +50,19 @@ fixed panel, and writes contig-level evidence. All action logic lives only in
 
 ## 3. Mainline
 
+The recommended upstream binning route is:
+
 ```text
-coarse assignments + Pore-C index + HG-VAE embedding + SCG index
+spectral coarse + HG-VAE embedding-assisted refine
+```
+
+In this route, `coarse/bins.tsv` is produced by spectral embedding plus
+HDBSCAN. HG-VAE does not directly define the coarse bins; it supplies the
+unsupervised similarity embedding consumed by refine. The pure
+`--coarse-method hgvae` route is retained as an experimental ablation.
+
+```text
+spectral coarse assignments + Pore-C index + HG-VAE embedding + SCG index
     |
     v
 initialize incremental state and bin profiles
@@ -149,6 +160,7 @@ d[i,b] = ||z[i] - mu[b]||_2
 med[b] = median_{i in b} d[i,b]
 mad[b] = median_{i in b} |d[i,b] - med[b]|
 rho[b] = med[b] + 3 * mad[b]
+score(i,b) = d[i,b] / (rho[b] + eps)
 ```
 
 Purpose:
@@ -156,6 +168,7 @@ Purpose:
 - `mu[b]` is the latent center of a bin;
 - `med[b]` is its robust latent dispersion;
 - `rho[b]` is the direct recruit compatibility radius;
+- `score(i,b)` is the radius-normalized recruit target distance;
 - before/after median dispersion protects split from making child groups less
   coherent;
 - merge compares center distance with `rho[a] + rho[b]`.
@@ -382,7 +395,7 @@ Let:
 
 ```text
 b_contact = argmax_b P(i,b)
-b_latent  = argmin_b d(i,b)
+b_latent  = argmin_b score(i,b)
 ```
 
 Generate a recruit proposal only when `b_contact == b_latent`.
@@ -394,13 +407,27 @@ Candidate-generation rules:
 3. the best Pore-C target itself must be a stable target bin;
 4. the target must be supported by at least two incident hyperedges;
 5. `P(i,b_contact) >= 0.5`;
-6. the HG-VAE nearest target is calculated exactly over stable bin centroids;
-7. an exact nearest-distance tie causes abstention;
+6. the HG-VAE target is the stable bin with minimum `score(i,b)`;
+7. an exact best-score tie causes abstention;
 8. Pore-C and HG-VAE targets must be identical.
 
 The generator records raw support, runner-up support, support share, margin,
-supporting edge count, latent distance, target radius, both target IDs, and a
-stable reason code. These values are evidence records, not a combined score.
+supporting edge count, latent distance, latent score, target radius, both
+target IDs, and a stable reason code. These values are evidence records, not a
+combined action score.
+
+The recruit action note uses schema version 2 and keeps both old compact keys
+and explicit audit keys:
+
+```text
+porec_target_bin
+hgvae_target_bin
+target_agreement
+hgvae_target_distance
+hgvae_target_score
+hgvae_target_radius
+hgvae_score_formula = latent_distance/(target_radius+eps)
+```
 
 The radius check remains in the shared policy rather than the generator. This
 keeps the responsibilities separate:
@@ -423,7 +450,7 @@ The logic is:
 
 ```text
 Pore-C selects the structurally supported bin
--> HG-VAE independently selects the nearest feature/contact representation
+-> HG-VAE independently selects the best radius-normalized representation
 -> agreement produces one candidate
 -> SCG prevents biological contamination
 ```
@@ -539,6 +566,13 @@ final/refine_meta.json
 The replacement has no action classifier and does not write action-feature,
 action-score, or embedding-score tables.
 
+`final/refine_actions.tsv` stores direct evidence in the `note` column. For
+accepted recruit actions, the note records the Pore-C target, HG-VAE
+radius-normalized target, target agreement flag, raw distance, normalized
+score, and the final radius policy gate. `final/refine_meta.json` mirrors this
+with an `embedding_evidence` block so the run-level method identity is
+auditable without parsing every action row.
+
 ## 15. Implementation Sequence
 
 Completed:
@@ -559,6 +593,8 @@ Completed:
 12. SCG discovery and fixed panel moved to `evidence/scg/`;
 13. legacy refine package, scorers, reassign route, and legacy-only tests
     removed.
+14. HG-VAE embedding role metadata, CLI/docs semantics, recruit
+    radius-normalized target selection, and action-note audit fields.
 
 ## 16. Required Tests
 

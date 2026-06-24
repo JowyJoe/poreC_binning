@@ -10,6 +10,7 @@ from tests.porebin_genome_testkit import (
     read_json,
     read_tsv_rows,
     write_noop_refine_fixture,
+    write_recruit_refine_fixture,
     write_split_refine_fixture,
 )
 
@@ -107,6 +108,8 @@ def test_replacement_orchestrator_writes_stage_log_without_checkpoints(
     assert meta["engine"] == "replacement_refinement"
     assert meta["checkpoint_enabled"] is False
     assert meta["stage_order"] == ["split", "merge", "recruit"]
+    assert meta["inputs"]["refine_embedding_source"] == "hgvae"
+    assert meta["inputs"]["embedding_role"] == "hgvae_similarity_evidence"
     assert meta["contact_index"]["counters"]["full_edge_scans"] == 2
     assert not list((tmp_path / "out").rglob("*checkpoint*"))
 
@@ -193,6 +196,66 @@ def test_replacement_orchestrator_applies_scg_guided_split_sequentially(
     assert meta["stage_counts"]["split"]["suspect"] == 1
     assert meta["stage_counts"]["split"]["accepted"] == 1
     assert meta["contact_index"]["counters"]["full_edge_scans"] == 2
+
+
+def test_recruit_action_note_records_porec_hgvae_agreement(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyarrow")
+    from porebin_genome.refinement.orchestrate import run_refinement
+
+    fixture = write_recruit_refine_fixture(tmp_path)
+    embedding = _write_embedding(
+        tmp_path / "embedding.tsv",
+        {
+            "a": (1.0, 0.0),
+            "b": (1.0, 0.0),
+            "h": (1.0, 0.0),
+        },
+    )
+
+    result = run_refinement(
+        contigs_fasta=fixture["contigs"],
+        coarse_bins_tsv=fixture["coarse_bins"],
+        contacts_parquet=fixture["contacts"],
+        coverage_tsv=fixture["coverage"],
+        embedding_tsv=embedding,
+        enable_scg=False,
+        out_dir=tmp_path / "out",
+    )
+
+    recruit_rows = [
+        row
+        for row in read_tsv_rows(result.refine_actions_tsv)
+        if row["action_type"] == "recruit"
+    ]
+    assert len(recruit_rows) == 1
+    assert recruit_rows[0]["accepted"] == "1"
+    note = json.loads(recruit_rows[0]["note"])
+    candidate = note["candidate"]
+
+    assert candidate["note_schema_version"] == 2
+    assert candidate["selector"] == (
+        "porec_best_target_and_hgvae_min_radius_normalized_score"
+    )
+    assert candidate["target_agreement"] is True
+    assert candidate["porec_target_bin"] == 0
+    assert candidate["hgvae_target_bin"] == 0
+    assert candidate["hgvae_score_formula"] == (
+        "latent_distance/(target_radius+eps)"
+    )
+    assert candidate["hgvae_target_score"] == pytest.approx(0.0)
+    assert candidate["porec_supporting_edges"] >= 2
+
+    assert note["embedding"]["type"] == "recruit_contig_to_bin"
+    assert note["embedding"]["rule"] == "distance <= target_radius"
+    assert note["embedding"]["inside_radius"] is True
+
+    meta = read_json(result.refine_meta_json)
+    assert meta["embedding_evidence"]["enabled"] is True
+    assert meta["embedding_evidence"]["source"] == "hgvae"
+    assert meta["embedding_evidence"]["action_note_schema_version"] == 2
+    assert "radius-normalized" in meta["embedding_evidence"]["recruit_selector"]
 
 
 def test_stage_log_records_input_failure_without_partial_results(

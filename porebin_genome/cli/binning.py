@@ -37,7 +37,10 @@ def bin_command(
     coarse_method: str = typer.Option(
         DEFAULT_COARSE_METHOD,
         "--coarse-method",
-        help="Coarse discovery method: spectral or hgvae.",
+        help=(
+            "Coarse discovery method: spectral is the stable recommended "
+            "route; hgvae is an experimental direct-clustering ablation."
+        ),
     ),
     contact_weight_mode: str = typer.Option(
         "hypergraph-native",
@@ -66,7 +69,11 @@ def bin_command(
     hyperedge_embedding: bool = typer.Option(
         False,
         "--hyperedge-embedding/--no-hyperedge-embedding",
-        help="Train feature-anchored hypergraph VAE embeddings from TNF/coverage and Pore-C contacts.",
+        help=(
+            "Train feature-anchored HG-VAE embeddings from TNF/coverage "
+            "and Pore-C contacts. Recommended with spectral coarse so "
+            "refine can use HG-VAE as similarity evidence."
+        ),
     ),
     hyperedge_embedding_dim: int = typer.Option(
         DEFAULT_HYPEREDGE_EMBEDDING_DIM,
@@ -110,7 +117,7 @@ def bin_command(
     ),
     out: Path = typer.Option(..., "--out", help="Output directory."),
 ) -> None:
-    """Run coarse candidate-bin discovery followed by the genome-centric refine MVP."""
+    """Run coarse candidate-bin discovery followed by genome-centric refine."""
     out = out.resolve()
     params = {
         "contigs": str(contigs),

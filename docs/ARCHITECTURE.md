@@ -73,19 +73,26 @@ W_e     = q_e / max(k_eff,e - 1, 1)^eta
 
 The pairwise route is a comparison baseline only. It does not feed normalized pairwise weights back into the hypergraph mainline.
 
-`coarse/` now has two complete coarse clustering methods:
+`coarse/` now has one recommended stable method and one experimental ablation:
 
 ```text
 --coarse-method spectral
+  recommended stable route:
   contact hypergraph + feature hypergraph -> spectral embedding -> HDBSCAN
 
 --coarse-method hgvae
+  experimental direct-clustering ablation:
   TNF/coverage + Pore-C hyperedges -> HG-VAE latent -> HDBSCAN
 ```
 
-Feature-anchored HG-VAE embeddings can also be trained from TNF/coverage
-features plus Pore-C hyperedges while using the spectral method. In that case,
-the same latent vectors are used directly by replacement refine.
+The recommended mainline is:
+
+```text
+--coarse-method spectral --hyperedge-embedding
+```
+
+In this route, spectral writes `coarse/bins.tsv`, and feature-anchored HG-VAE
+embeddings are trained only as refinement similarity evidence.
 
 HG-VAE uses:
 
@@ -96,6 +103,10 @@ L = L_feat + beta * L_prior + lambda * L_contact
 ```
 
 where `L_feat` reconstructs TNF/coverage with block-balanced TNF and coverage losses, `L_prior` regularizes the VAE latent space, and `L_contact = sum_e s_e Var_e(Z) / sum_e s_e` keeps contigs from reliable Pore-C hyperedges close in latent space. `Var_e` is the alpha-weighted dispersion inside one hyperedge, and `s_e` combines contact strength with TNF/coverage compatibility.
+
+The pure `--coarse-method hgvae` route remains available for ablation, but it
+is not the recommended default because current CheckM2 results show many more
+low-quality bins than the spectral mainline.
 
 ### `refinement/`
 
@@ -113,7 +124,8 @@ Implements the replacement refine architecture:
 
 The replacement deliberately has no independent reassign/release stage and no
 opaque action classifier. TNF and coverage remain in profiles and final QC,
-while HG-VAE is the action-level representation.
+while HG-VAE is the action-level representation in the recommended
+spectral-plus-HG-VAE route.
 
 Split generation is already implemented in `refinement/split.py`. It selects
 the most repeated canonical SCG, uses its carrier contigs as explicit HG-VAE
@@ -131,10 +143,11 @@ transaction, preserving the one-scan stage semantics.
 
 Recruit candidate generation is implemented in `refinement/recruit.py`.
 Only current unbinned contigs are considered. Pore-C selects a best target from
-incident hyperedges, HG-VAE independently selects the nearest stable bin, and
-only agreement creates a proposal. Ties abstain. Accepted recruits are applied
-sequentially; later ready contigs are refreshed locally after a state change so
-SCG, contact, centroid, and radius evidence cannot become stale.
+incident hyperedges, HG-VAE independently selects the stable bin with the
+smallest radius-normalized distance, and only agreement creates a proposal.
+Ties abstain. Accepted recruits are applied sequentially; later ready contigs
+are refreshed locally after a state change so SCG, contact, centroid, and
+radius evidence cannot become stale.
 
 SCG discovery uses the bundled `evidence/scg/marker.hmm` panel. Its 111 raw
 profiles are normalized to the 107-marker order embedded in
@@ -172,6 +185,11 @@ Exports final bins and unresolved contigs as FASTA.
 - `final/refine_actions.tsv`
 - `final/refine_stage_log.jsonl`
 - `final/refine_meta.json`
+
+`final/refine_actions.tsv` keeps action evidence in the `note` JSON. Recruit
+notes include Pore-C target support, HG-VAE radius-normalized target score,
+target agreement, and the final embedding radius check. `final/refine_meta.json`
+contains the run-level `embedding_evidence` block describing the same rules.
 
 Optional outputs:
 

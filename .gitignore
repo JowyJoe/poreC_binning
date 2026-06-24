@@ -17,6 +17,7 @@ out/
 outputs/
 results/
 logs/
+scripts/
 
 # OS
 .DS_Store
@@ -26,3 +27,4 @@ Thumbs.db
 docs/*
 !docs/REFINE_DESIGN.md
 !docs/ARCHITECTURE.md
+!docs/HGVAE_EMBEDDING_STRATEGY.md

@@ -106,7 +106,7 @@ porebin evidence \
   --out "$WORK/evidence_run"
 ```
 
-Run the default spectral hypergraph route:
+Run the recommended spectral + HG-VAE embedding-assisted route:
 
 ```bash
 porebin bin \
@@ -114,11 +114,14 @@ porebin bin \
   --contacts "$WORK/evidence_run/evidence/contacts.parquet" \
   --coverage-tsv "$WORK/evidence_run/evidence/coverage.tsv" \
   --coarse-method spectral \
-  --pairwise-baseline \
-  --out "$WORK/spectral_run"
+  --hyperedge-embedding \
+  --out "$WORK/spectral_hgvae_run"
 ```
 
-Run the complete HG-VAE route:
+Add `--pairwise-baseline` to the command above when you also want the separate
+pairwise Leiden comparison.
+
+Run the pure HG-VAE coarse ablation:
 
 ```bash
 porebin bin \
@@ -126,19 +129,20 @@ porebin bin \
   --contacts "$WORK/evidence_run/evidence/contacts.parquet" \
   --coverage-tsv "$WORK/evidence_run/evidence/coverage.tsv" \
   --coarse-method hgvae \
-  --out "$WORK/hgvae_run"
+  --out "$WORK/hgvae_ablation"
 ```
 
 If you want a fast algorithm-only smoke test without SCG checks, add `--disable-scg` to the `porebin bin` commands. For final benchmarking, keep SCG enabled.
 
-Export HG-VAE final bins:
+Export recommended final bins:
 
 ```bash
 porebin export \
   --contigs "$CONTIGS" \
-  --bins-refined-tsv "$WORK/hgvae_run/final/bins.refined.tsv" \
-  --unbinned-tsv "$WORK/hgvae_run/final/unbinned.tsv" \
-  --out "$WORK/hgvae_export"
+  --bins-refined-tsv "$WORK/spectral_hgvae_run/final/bins.refined.tsv" \
+  --unbinned-tsv "$WORK/spectral_hgvae_run/final/unbinned.tsv" \
+  --out "$WORK/spectral_hgvae_export"
+```
 
 
 ### External command-line dependencies
@@ -203,16 +207,17 @@ hyperedges once, accumulates bin-pair support
 `T(a,b)=sum_e r_e m_ea m_eb`, normalizes it by
 `sqrt(D[a]D[b]+eps)`, and proposes only mutual-best pairs supported by at
 least two hyperedges. Merge objects are complete non-empty bins with no SCG
-duplication and complete HG-VAE evidence. A merge is accepted only when it
+duplication and non-missing HG-VAE evidence. A merge is accepted only when it
 creates no duplicated SCG and the two robust HG-VAE regions overlap. Accepted
 mutual-best pairs are bin-disjoint and are committed together in one
 versioned assignment/contact/profile transaction.
 
 Recruit candidate generation is implemented for current unbinned contigs
 only. Pore-C support from incident hyperedges selects one target, while HG-VAE
-distance independently selects the nearest stable bin. A proposal exists only
-when the two targets agree; contact ties, latent ties, unstable targets,
-missing embeddings, and insufficient support produce explicit abstention.
+distance independently selects the stable bin with the smallest
+radius-normalized distance. A proposal exists only when the two targets agree;
+contact ties, latent score ties, unstable targets, missing embeddings, and
+insufficient support produce explicit abstention.
 Accepted recruits are applied one at a time, and later candidates are refreshed
 locally after state changes so SCG and bin-profile evidence remain current.
 
@@ -286,8 +291,14 @@ Optional audit and comparison outputs may also be written when their flags are e
 Coarse discovery is selected with:
 
 ```text
---coarse-method spectral   # default: contact hypergraph + feature hypergraph -> spectral embedding -> HDBSCAN
---coarse-method hgvae      # ML route: TNF/coverage + Pore-C hyperedges -> HG-VAE latent -> HDBSCAN
+--coarse-method spectral   # stable route: contact hypergraph + feature hypergraph -> spectral embedding -> HDBSCAN
+--coarse-method hgvae      # experimental ablation: HG-VAE latent -> HDBSCAN
+```
+
+The recommended route is spectral coarse plus HG-VAE embeddings for refine:
+
+```text
+--coarse-method spectral --hyperedge-embedding
 ```
 
 ### Hypergraph-native contact weight
@@ -330,9 +341,15 @@ Pore-C hyperedges
 
 This pairwise route is intentionally simple and is not mass-conserved. It is meant to show what happens when high-order Pore-C contacts are flattened into ordinary pairwise contacts. Its normalized pairwise weights are not used to define hypergraph weights.
 
-### HG-VAE coarse route
+### HG-VAE embedding evidence
 
-`--coarse-method hgvae` trains an unsupervised feature-anchored hypergraph VAE and clusters the learned latent space with HDBSCAN. `--hyperedge-embedding` can still be used with the default spectral route when only the embedding audit/refine scorer is desired.
+`--hyperedge-embedding` trains an unsupervised feature-anchored hypergraph VAE
+and writes latent vectors for replacement refine. In the recommended mainline,
+spectral still produces `coarse/bins.tsv`; HG-VAE only supplies similarity
+evidence for split, merge, and recruit.
+
+`--coarse-method hgvae` is retained as an experimental ablation that clusters
+the HG-VAE latent space with HDBSCAN.
 
 For contig `i`:
 
@@ -393,14 +410,15 @@ The total training objective is:
 L = L_feat + beta * L_prior + lambda * L_contact
 ```
 
-In HG-VAE mode, the resulting latent matrix is the coarse clustering surface:
+In the experimental HG-VAE coarse ablation, the resulting latent matrix is the
+coarse clustering surface:
 
 ```text
 Z_hgvae -> HDBSCAN -> coarse/bins.tsv
 ```
 
-The same `coarse/hyperedge_embedding.tsv` is used directly by replacement
-refine for HG-VAE compatibility checks.
+In the recommended route, the same `coarse/hyperedge_embedding.tsv` is used
+directly by replacement refine for HG-VAE compatibility checks.
 
 ### Replacement refine design
 
@@ -451,11 +469,13 @@ porebin evidence \
   --contigs contigs.fasta \
   --out run_out
 
-# run coarse discovery + refine MVP
+# run the recommended spectral + HG-VAE embedding-assisted mainline
 porebin bin \
   --contigs contigs.fasta \
   --contacts run_out/evidence/contacts.parquet \
   --coverage-tsv run_out/evidence/coverage.tsv \
+  --coarse-method spectral \
+  --hyperedge-embedding \
   --out run_out
 
 # run the optional pairwise Leiden baseline without affecting the hypergraph main method
@@ -463,18 +483,21 @@ porebin bin \
   --contigs contigs.fasta \
   --contacts run_out/evidence/contacts.parquet \
   --coverage-tsv run_out/evidence/coverage.tsv \
+  --coarse-method spectral \
+  --hyperedge-embedding \
   --pairwise-baseline \
   --out run_out
 
-# train feature-anchored HG-VAE embeddings for replacement refine
+# fast spectral-only ablation without HG-VAE refine evidence
 porebin bin \
   --contigs contigs.fasta \
   --contacts run_out/evidence/contacts.parquet \
   --coverage-tsv run_out/evidence/coverage.tsv \
-  --hyperedge-embedding \
+  --coarse-method spectral \
+  --no-hyperedge-embedding \
   --out run_out
 
-# run the complete HG-VAE coarse route
+# run the pure HG-VAE coarse ablation
 porebin bin \
   --contigs contigs.fasta \
   --contacts run_out/evidence/contacts.parquet \
@@ -502,7 +525,11 @@ porebin export \
 
 ### `coarse/bins.tsv`
 
-Candidate genome bins from the coarse discovery stage. These are not final bins. With `--coarse-method spectral`, they come from joint spectral embedding plus HDBSCAN. With `--coarse-method hgvae`, they come from HG-VAE latent embedding plus HDBSCAN.
+Candidate genome bins from the coarse discovery stage. These are not final
+bins. In the recommended route, they come from `--coarse-method spectral`:
+joint spectral embedding plus HDBSCAN. With the experimental
+`--coarse-method hgvae` ablation, they come from HG-VAE latent embedding plus
+HDBSCAN.
 
 ### Pairwise baseline outputs
 
@@ -512,10 +539,12 @@ When `--pairwise-baseline` is enabled, `coarse/bins.pairwise_leiden.tsv` contain
 
 When `--hyperedge-embedding` is enabled, this file contains feature-anchored
 HG-VAE latent vectors for contigs. The model learns from TNF/coverage
-reconstruction and Pore-C hyperedge regularization. Replacement refine uses
-these vectors directly.
+reconstruction and Pore-C hyperedge regularization. In the recommended route,
+replacement refine uses these vectors directly while `coarse/bins.tsv` remains
+spectral.
 
-This file is written automatically when `--coarse-method hgvae` is used.
+This file is written automatically when `--coarse-method hgvae` is used for
+the experimental ablation.
 
 ### `final/bins.refined.tsv`
 
@@ -538,6 +567,9 @@ Contigs that remain unresolved after refinement, with explicit stage and reason.
 
 Accepted, rejected, and abstained split, merge, and recruit records. Each row
 keeps direct gate evidence in `note`; there is no combined confidence score.
+For recruit actions, `note` records the Pore-C target, the HG-VAE target,
+whether the two targets agree, the raw latent distance, the
+radius-normalized HG-VAE score, and the radius gate used by the policy.
 
 ### `final/refine_stage_log.jsonl`
 
@@ -548,14 +580,17 @@ progress log only. Refine writes no checkpoint or resumable assignment state.
 ### `final/refine_meta.json`
 
 Stage-level engine identity, candidate/action counts, evidence settings, and
-final unbinned counts.
+final unbinned counts. The `embedding_evidence` block states that HG-VAE is
+used as similarity evidence, records the recruit score formula, and names the
+split, merge, and recruit rules used in action notes.
 
 ## Method boundaries
 
 - coarse discovery does not promote HDBSCAN noise into bins by component-majority postprocessing
 - the pairwise Leiden baseline is a separate comparison route and does not feed pairwise weights into the hypergraph main method
 - the default hypergraph main method uses only Pore-C hyperedge-native quantities (`q_e`, `alpha_ie`, `k_eff`) for contact weights
-- HG-VAE learns TNF/coverage directly and uses Pore-C contacts as hypergraph regularization; in `--coarse-method hgvae`, that latent space directly drives HDBSCAN coarse clustering
+- HG-VAE learns TNF/coverage directly and uses Pore-C contacts as hypergraph regularization; in the recommended route, it is refine similarity evidence rather than the coarse clustering source
+- `--coarse-method hgvae` is retained as an experimental direct-clustering ablation
 - replacement refine uses only split, merge, and recruit with ordered SCG, Pore-C, and HG-VAE evidence
 - candidate actions must use incident-edge indexes instead of rescanning all hyperedges
 - unresolved contigs remain explicit instead of being forced into bins

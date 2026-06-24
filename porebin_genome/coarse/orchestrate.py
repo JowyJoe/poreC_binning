@@ -403,6 +403,7 @@ def run_coarse_discovery(
     )
     run_record["coarse_method"] = coarse_method_name
     run_record["embedding_source"] = embedding_source
+    run_record["coarse_embedding_source"] = embedding_source
     run_record["clustering_method"] = "hdbscan"
     run_record["feature_knn_mode"] = feature_knn_mode if coarse_method_name == "spectral" else "not_used"
     run_record["contact_weight_mode"] = weight_mode
@@ -418,6 +419,14 @@ def run_coarse_discovery(
     run_record["hyperedge_vae_lambda"] = float(hyperedge_vae_lambda)
     run_record["hyperedge_vae_batch_size"] = int(hyperedge_vae_batch_size)
     run_record["hyperedge_feature_guard"] = bool(hyperedge_feature_guard)
+    run_record["refine_embedding_source"] = (
+        "hgvae" if hyperedge_embedding_tsv is not None else None
+    )
+    run_record["hgvae_role"] = (
+        "experimental_coarse"
+        if coarse_method_name == "hgvae"
+        else ("refine_embedding" if hyperedge_embedding_tsv is not None else "not_used")
+    )
     run_record["outputs"].update(pairwise_outputs)
     run_record["outputs"].update(hyperedge_embedding_outputs)
     if adaptive_k_meta is not None:

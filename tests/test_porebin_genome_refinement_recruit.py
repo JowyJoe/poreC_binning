@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from porebin_genome.evidence.canonical import CanonicalContact
@@ -115,6 +117,7 @@ def test_recruit_batch_is_local_deterministic_and_explainable() -> None:
     assert ready.target_share is not None
     assert ready.target_share > 0.99
     assert ready.latent_distance is not None
+    assert ready.latent_score is not None
     assert ready.target_radius is not None
     assert ready.proposal is not None
     assert outcomes[5].reason == "contact_latent_target_disagree"
@@ -159,6 +162,59 @@ def test_latent_tie_abstains_without_bin_id_tie_breaking() -> None:
     assert candidate.reason == "latent_best_target_tied"
     assert candidate.contact_target_bin_idx == 0
     assert candidate.proposal is None
+
+
+def test_latent_target_uses_radius_normalized_distance() -> None:
+    names = ("a1", "a2", "b1", "b2", "u")
+    index = build_contact_index_from_contacts(
+        [
+            CanonicalContact(0, ["u", "b1"], [0.5, 0.5], 2, 2, 1.0),
+            CanonicalContact(1, ["u", "b2"], [0.5, 0.5], 2, 2, 1.0),
+        ],
+        contig_names=names,
+    )
+    state = RefineState(
+        contact_index=index,
+        assignment=np.asarray([0, 0, 1, 1, -1], dtype=np.int32),
+        contig_lengths=np.asarray([2000, 2000, 2000, 2000, 1000]),
+        n_bins=2,
+    )
+    angle_2 = math.radians(2.0)
+    angle_6 = math.radians(6.0)
+    inputs = EvidenceInputs.from_arrays(
+        contact_index=index,
+        embedding=np.asarray(
+            [
+                [1.0, 0.0],
+                [math.cos(angle_2), math.sin(angle_2)],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [math.cos(angle_6), math.sin(angle_6)],
+            ],
+            dtype=np.float64,
+        ),
+    )
+    profiles = EvidenceProfileState(refine_state=state, inputs=inputs)
+
+    candidate = generate_recruit_candidate(
+        contig_idx=4,
+        state=state,
+        profiles=profiles,
+    )
+
+    distance_to_tight_bin = profiles.contig_bin_metrics(
+        4,
+        0,
+    ).embedding_distance
+    assert distance_to_tight_bin is not None
+    assert candidate.latent_distance is not None
+    assert candidate.latent_score is not None
+    assert candidate.target_radius is not None
+    assert distance_to_tight_bin < candidate.latent_distance
+    assert candidate.latent_target_bin_idx == 1
+    assert candidate.contact_target_bin_idx == 1
+    assert candidate.status is RecruitCandidateStatus.READY
+    assert candidate.latent_score < 1.0
 
 
 def test_ready_candidate_matches_shared_evidence_and_is_accepted() -> None:
